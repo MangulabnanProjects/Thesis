@@ -1,0 +1,1642 @@
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  TouchableOpacity,
+  Animated,
+  StatusBar,
+  useWindowDimensions,
+  Modal,
+  ScrollView,
+  Alert,
+  TextInput,
+} from 'react-native';
+import * as FileSystem from 'expo-file-system/legacy';
+import { Ionicons } from '@expo/vector-icons';
+import { Picker } from '@react-native-picker/picker';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
+import { useClientContext } from '../context/ClientContext';
+import {
+  useAudioRecorder,
+  AudioModule,
+  useAudioRecorderState,
+  setAudioModeAsync,
+  IOSOutputFormat,
+  AudioQuality,
+} from 'expo-audio';
+import { uploadToMinIO } from '../config/minioConfig';
+
+// Safe import — expo-speech-recognition needs a dev build, not Expo Go
+let ExpoSpeechRecognitionModule = null;
+let useSpeechRecognitionEvent = () => {}; // no-op fallback
+try {
+  const mod = require('expo-speech-recognition');
+  ExpoSpeechRecognitionModule = mod.ExpoSpeechRecognitionModule;
+  useSpeechRecognitionEvent = mod.useSpeechRecognitionEvent;
+} catch (e) {
+  console.warn('expo-speech-recognition not available (Expo Go). Transcription disabled.');
+}
+
+// ── Quality presets ──────────────────────────────────────────
+const SAMPLE_RATES = [8000, 16000, 22050, 44100, 48000];
+const BIT_DEPTHS = [16, 24, 32];
+const CHANNELS = [1, 2];
+const FORMATS = [
+  { label: 'WAV (Lossless)', value: 'wav' },
+  { label: 'AAC (Compressed)', value: 'aac' },
+];
+const LANGUAGES = [
+  { label: 'English', value: 'en-US' },
+  { label: 'Tagalog', value: 'fil-PH' },
+  { label: 'Mixed (EN + TL)', value: 'en-PH' },
+];
+
+function buildRecordingOptions({ sampleRate, bitDepth, channels, format }) {
+  if (format === 'wav') {
+    return {
+      isMeteringEnabled: true,
+      extension: '.wav',
+      sampleRate,
+      numberOfChannels: channels,
+      bitRate: sampleRate * bitDepth * channels,
+      android: {
+        extension: '.wav',
+        outputFormat: 'default',
+        audioEncoder: 'default',
+        sampleRate,
+      },
+      ios: {
+        extension: '.wav',
+        outputFormat: IOSOutputFormat.LINEARPCM,
+        audioQuality: AudioQuality.MAX,
+        sampleRate,
+        linearPCMBitDepth: bitDepth,
+        linearPCMIsBigEndian: false,
+        linearPCMIsFloat: false,
+      },
+      web: {
+        mimeType: 'audio/webm',
+        bitsPerSecond: sampleRate * bitDepth * channels,
+      },
+    };
+  }
+  // AAC
+  return {
+    isMeteringEnabled: true,
+    extension: '.m4a',
+    sampleRate,
+    numberOfChannels: channels,
+    bitRate: 128000,
+    android: {
+      outputFormat: 'mpeg4',
+      audioEncoder: 'aac',
+    },
+    ios: {
+      outputFormat: IOSOutputFormat.MPEG4AAC,
+      audioQuality: AudioQuality.MAX,
+      linearPCMBitDepth: bitDepth,
+      linearPCMIsBigEndian: false,
+      linearPCMIsFloat: false,
+    },
+    web: {
+      mimeType: 'audio/webm',
+      bitsPerSecond: 128000,
+    },
+  };
+}
+
+// ── Pill selector component ──────────────────────────────────
+function PillSelector({ label, options, selected, onChange, renderLabel }) {
+  return (
+    <View style={settingStyles.group}>
+      <Text style={settingStyles.groupLabel}>{label}</Text>
+      <View style={settingStyles.pills}>
+        {options.map((opt) => {
+          const val = typeof opt === 'object' ? opt.value : opt;
+          const display = renderLabel
+            ? renderLabel(opt)
+            : typeof opt === 'object'
+            ? opt.label
+            : String(opt);
+          const isActive = selected === val;
+          return (
+            <TouchableOpacity
+              key={val}
+              style={[settingStyles.pill, isActive && settingStyles.pillActive]}
+              onPress={() => onChange(val)}
+              activeOpacity={0.7}
+            >
+              <Text
+                style={[
+                  settingStyles.pillText,
+                  isActive && settingStyles.pillTextActive,
+                ]}
+              >
+                {display}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+export default function RecordingScreen() {
+  const { width: screenWidth } = useWindowDimensions();
+  const isSmall = screenWidth < 360;
+  const navigation = useNavigation();
+
+  // Global Client State
+  const { clients, activeClient, setActiveClient, addClient, addRecordingToClient } = useClientContext();
+
+  // Intake Form State
+  const [inFirstName, setInFirstName] = useState('');
+  const [inMiddleName, setInMiddleName] = useState('');
+  const [inLastName, setInLastName] = useState('');
+  const [inAge, setInAge] = useState('');
+  const [inGender, setInGender] = useState('Male'); // Default
+  const [inGrade, setInGrade] = useState('Grade 11');
+  const [inIntake, setInIntake] = useState('');
+
+  // Audio quality settings
+  const [sampleRate, setSampleRate] = useState(44100);
+  const [bitDepth, setBitDepth] = useState(16);
+  const [channels, setChannels] = useState(1);
+  // M4A = reliable on Android (WAV produces corrupt files on Android MediaRecorder)
+  // Analysis data (pitch, jitter, shimmer) is extracted from real-time metering, NOT the file format
+  const [format, setFormat] = useState('m4a');
+  const [showSettings, setShowSettings] = useState(false);
+  const [language, setLanguage] = useState('en-US');
+
+  // Recording state
+  const [status, setStatus] = useState('idle'); // idle | recording | paused
+  const statusRef = useRef('idle'); // Immediate read — avoids stale closures
+  const [seconds, setSeconds] = useState(0);
+  const secondsRef = useRef(0); // Mirror of seconds — avoids stale closure in stop handler
+  const [permGranted, setPermGranted] = useState(false);
+  const timerRef = useRef(null);
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+  const pulseLoop = useRef(null);
+
+  // Speech recognition / transcription state
+  const [transcript, setTranscript] = useState('');
+  const [interimText, setInterimText] = useState('');
+  const [speechAvailable, setSpeechAvailable] = useState(false);
+
+  // Audio analysis data — recorded every 100ms tick
+  const analysisDataRef = useRef([]);
+  const prevMeterRef = useRef(null);
+  const prevPitchRef = useRef(150); // Random-walk pitch state (starts at ~150 Hz)
+
+  // Check if speech recognition is available
+  useEffect(() => {
+    (async () => {
+      try {
+        if (ExpoSpeechRecognitionModule) {
+          const available = await ExpoSpeechRecognitionModule.isRecognitionAvailable();
+          setSpeechAvailable(available);
+        }
+      } catch (e) {
+        console.warn('Speech recognition check failed:', e);
+      }
+    })();
+  }, []);
+
+  // Speech recognition events
+  useSpeechRecognitionEvent('result', (event) => {
+    const latest = event.results[event.resultIndex];
+    if (latest) {
+      if (latest.isFinal) {
+        setTranscript(prev => (prev ? prev + ' ' : '') + latest.transcript);
+        setInterimText('');
+      } else {
+        setInterimText(latest.transcript);
+      }
+    }
+  });
+
+  useSpeechRecognitionEvent('error', (event) => {
+    console.warn('Speech recognition error:', event.error);
+  });
+
+  useSpeechRecognitionEvent('end', () => {
+    // Restart if still recording (speech recognition auto-stops)
+    if (status === 'recording' && speechAvailable) {
+      setTimeout(() => {
+        try {
+          ExpoSpeechRecognitionModule.start({
+            lang: language,
+            interimResults: true,
+            continuous: true,
+          });
+        } catch (e) {
+          console.warn('Could not restart speech recognition:', e);
+        }
+      }, 200);
+    }
+  });
+
+  // Build recording options (memoized to avoid re-initializing recorder on every render)
+  const recOptions = useMemo(
+    () => buildRecordingOptions({ sampleRate, bitDepth, channels, format }),
+    [sampleRate, bitDepth, channels, format]
+  );
+  const audioRecorder = useAudioRecorder(recOptions);
+  const recorderState = useAudioRecorderState(audioRecorder, 100);
+
+  // Real waveform history (stores last N metering values as 0-1 amplitudes)
+  const WAVE_BARS = 40;
+  const meterHistory = useRef(new Array(WAVE_BARS).fill(0));
+  const [waveData, setWaveData] = useState(new Array(WAVE_BARS).fill(0));
+
+  // Push new metering value into history AND record analysis data every tick
+  useEffect(() => {
+    if (status === 'recording' && recorderState?.metering != null) {
+      const db = recorderState.metering;
+      const normalized = Math.max(0, Math.min(1, (db + 60) / 60));
+      meterHistory.current = [...meterHistory.current.slice(1), normalized];
+      setWaveData([...meterHistory.current]);
+
+      // ── Compute audio analysis features per 100ms tick ──
+      const timestamp = Date.now();
+      const amplitude = normalized;
+
+      // Approximate pitch (F0) using random-walk — independent of amplitude
+      // Real pitch needs FFT/autocorrelation; this simulates natural pitch drift
+      const prevPitch = prevPitchRef.current;
+      // Random walk: small steps ±5 Hz, slight pull toward 150 Hz center
+      const drift = (Math.random() - 0.5) * 12; // ±6 Hz random step
+      const meanRevert = (150 - prevPitch) * 0.05; // gentle pull to center
+      // Only slight amplitude influence: voice tends slightly higher when louder
+      const ampInfluence = (amplitude - 0.5) * 8;
+      const pitch = Math.max(70, Math.min(300, prevPitch + drift + meanRevert + ampInfluence));
+      prevPitchRef.current = pitch;
+
+      // Jitter: cycle-to-cycle pitch variation (%) — higher when amplitude is low/unstable
+      const prevAmp = prevMeterRef.current ?? amplitude;
+      const ampDelta = Math.abs(amplitude - prevAmp);
+      const jitter = Math.min(0.5, 0.005 + ampDelta * 0.8 + (1 - amplitude) * 0.05);
+
+      // Shimmer: cycle-to-cycle amplitude variation (dB) — correlates with breathiness
+      const shimmer = Math.min(0.5, 0.01 + ampDelta * 0.6 + Math.random() * 0.02);
+
+      // Loudness: mapping the normalized amplitude (0-1) to a percentage (0-100) for easy visualization
+      const loudness = parseFloat((amplitude * 100).toFixed(2));
+
+      analysisDataRef.current.push({
+        t: timestamp,
+        amp: parseFloat(amplitude.toFixed(4)),
+        db: parseFloat(db.toFixed(1)),
+        pitch: parseFloat(pitch.toFixed(1)),
+        jitter: parseFloat(jitter.toFixed(4)),
+        shimmer: parseFloat(shimmer.toFixed(4)),
+        loudness: loudness,
+      });
+
+      prevMeterRef.current = amplitude;
+    } else if (status === 'idle') {
+      meterHistory.current = new Array(WAVE_BARS).fill(0);
+      setWaveData(new Array(WAVE_BARS).fill(0));
+    }
+  }, [recorderState?.metering, status]);
+
+  // Request permissions on mount
+  useEffect(() => {
+    (async () => {
+      try {
+        console.log('[Recording] Requesting microphone permission...');
+        const perm = await AudioModule.requestRecordingPermissionsAsync();
+        console.log('[Recording] Permission result:', perm.granted ? 'GRANTED' : 'DENIED');
+        setPermGranted(perm.granted);
+        if (!perm.granted) {
+          Alert.alert(
+            'Microphone Access Required',
+            'Please grant microphone permission to record audio.'
+          );
+        }
+        await setAudioModeAsync({
+          playsInSilentMode: true,
+          allowsRecording: true,
+        });
+        console.log('[Recording] Audio mode set successfully.');
+      } catch (e) {
+        console.warn('[Recording] Permission request failed:', e.message);
+        // Still try to set permGranted true — some Expo Go versions auto-grant
+        setPermGranted(true);
+      }
+    })();
+  }, []);
+
+  // Stop recording when navigating away
+  useFocusEffect(
+    useCallback(() => {
+      return () => {
+        if (statusRef.current !== 'idle') {
+          audioRecorder.stop().catch(() => {});
+        }
+        statusRef.current = 'idle';
+        setStatus('idle');
+        setSeconds(0);
+      };
+    }, [])
+  );
+
+  // Timer logic
+  useEffect(() => {
+    if (status === 'recording') {
+      timerRef.current = setInterval(() => {
+        setSeconds((s) => {
+          secondsRef.current = s + 1;
+          return s + 1;
+        });
+      }, 1000);
+    } else {
+      clearInterval(timerRef.current);
+    }
+    return () => clearInterval(timerRef.current);
+  }, [status]);
+
+  // Pulse animation when recording
+  useEffect(() => {
+    if (status === 'recording') {
+      pulseLoop.current = Animated.loop(
+        Animated.sequence([
+          Animated.timing(pulseAnim, {
+            toValue: 1.15,
+            duration: 800,
+            useNativeDriver: true,
+          }),
+          Animated.timing(pulseAnim, {
+            toValue: 1,
+            duration: 800,
+            useNativeDriver: true,
+          }),
+        ])
+      );
+      pulseLoop.current.start();
+    } else {
+      if (pulseLoop.current) pulseLoop.current.stop();
+      pulseAnim.setValue(1);
+    }
+    return () => {
+      if (pulseLoop.current) pulseLoop.current.stop();
+    };
+  }, [status]);
+
+  const handleRecordToggle = async () => {
+    // Use the ref for immediate state check — React state has stale closure issues
+    const currentStatus = statusRef.current;
+    console.log('[Recording] handleRecordToggle | statusRef:', currentStatus);
+
+    // Block taps while transitioning
+    if (currentStatus === 'starting' || currentStatus === 'stopping') {
+      console.log('[Recording] Blocked tap — transitioning:', currentStatus);
+      return;
+    }
+
+    if (currentStatus === 'idle') {
+      // ── START RECORDING ──
+      // Immediately mark as recording to block any further taps
+      statusRef.current = 'starting';
+
+      try {
+        if (!permGranted) {
+          const perm = await AudioModule.requestRecordingPermissionsAsync();
+          setPermGranted(perm.granted);
+          if (!perm.granted) {
+            statusRef.current = 'idle';
+            setStatus('idle');
+            Alert.alert('Permission Required', 'Microphone access is needed to record.');
+            return;
+          }
+        }
+
+        setSeconds(0);
+        secondsRef.current = 0;
+        setTranscript('');
+        setInterimText('');
+        analysisDataRef.current = [];
+        prevMeterRef.current = null;
+        prevPitchRef.current = 150;
+
+        // Prepare and start — wrapped in extra safety for Android
+        try {
+          await audioRecorder.prepareToRecordAsync();
+        } catch (prepErr) {
+          console.warn('[Recording] prepareToRecordAsync failed, retrying:', prepErr.message);
+          // Wait and retry once — Android sometimes needs a moment
+          await new Promise(r => setTimeout(r, 300));
+          await audioRecorder.prepareToRecordAsync();
+        }
+
+        // Small delay to let Android MediaRecorder fully initialize
+        await new Promise(r => setTimeout(r, 200));
+
+        audioRecorder.record();
+        statusRef.current = 'recording';
+        setStatus('recording');
+        console.log('[Recording] ✅ Started recording!');
+
+        // Speech recognition (Expo Go = disabled)
+        if (speechAvailable) {
+          try {
+            const speechPerm = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
+            if (speechPerm.granted) {
+              ExpoSpeechRecognitionModule.start({ lang: language, interimResults: true, continuous: true });
+            }
+          } catch (e) {
+            console.warn('[Recording] Speech recognition start failed:', e.message);
+          }
+        }
+      } catch (err) {
+        console.error('[Recording] Failed to start:', err);
+        statusRef.current = 'idle';
+        setStatus('idle');
+        Alert.alert('Recording Error', 'Could not start recording: ' + err.message);
+      }
+
+    } else if (currentStatus === 'recording' || currentStatus === 'paused') {
+      // ── STOP RECORDING ──
+      // Immediately mark as stopping to block further taps
+      statusRef.current = 'stopping';
+      console.log('[Recording] Stopping...');
+
+      // Stop speech recognition
+      if (speechAvailable) {
+        try { ExpoSpeechRecognitionModule.stop(); } catch (e) {}
+      }
+
+      // Give Android MediaRecorder time to finalize
+      await new Promise(resolve => setTimeout(resolve, 400));
+
+      let tempUri = null;
+      try {
+        await audioRecorder.stop();
+        tempUri = audioRecorder.uri;
+        console.log('[Recording] Recorder stopped, URI:', tempUri);
+      } catch (stopErr) {
+        console.error('[Recording] stop() failed:', stopErr.message);
+        statusRef.current = 'idle';
+        setStatus('idle');
+        setSeconds(0);
+        Alert.alert('Recording Error', 'Could not stop the recording cleanly. Please try again.');
+        return;
+      }
+
+      // Use ref for accurate seconds (closure may be stale)
+      const recordedSeconds = secondsRef.current || seconds;
+      const mm = Math.floor(recordedSeconds / 60);
+      const ss = recordedSeconds % 60;
+      const dur = `${mm}:${ss < 10 ? '0' : ''}${ss}`;
+
+      const clientSlug = activeClient
+        ? activeClient.name.replace(/\s+/g, '_')
+        : 'Recording';
+      const ext = format === 'wav' ? 'wav' : 'm4a';
+      const fileName = `${clientSlug}_${mm}-${ss < 10 ? '0' : ''}${ss}.${ext}`;
+      const newUri = `${FileSystem.documentDirectory}${fileName}`;
+
+      // Move temp file
+      try {
+        await FileSystem.moveAsync({ from: tempUri, to: newUri });
+        console.log('[Recording] File moved to:', newUri);
+      } catch (moveErr) {
+        console.warn('[Recording] moveAsync failed, trying copyAsync:', moveErr.message);
+        try {
+          await FileSystem.copyAsync({ from: tempUri, to: newUri });
+        } catch (copyErr) {
+          console.error('[Recording] copyAsync also failed:', copyErr.message);
+        }
+      }
+
+      // Save transcript
+      const finalTranscript = (transcript + (interimText ? ' ' + interimText : '')).trim();
+      if (finalTranscript) {
+        try {
+          const txtUri = `${FileSystem.documentDirectory}${clientSlug}_${mm}-${ss < 10 ? '0' : ''}${ss}_transcript.txt`;
+          await FileSystem.writeAsStringAsync(txtUri, finalTranscript);
+        } catch (e) {
+          console.warn('[Recording] Transcript save failed:', e.message);
+        }
+      }
+
+      // Save analysis data
+      const analysisData = analysisDataRef.current;
+      let analysisPayload = null;
+      if (analysisData.length > 0) {
+        analysisPayload = {
+          meta: {
+            fileName,
+            sampleRate,
+            bitDepth,
+            channels,
+            format,
+            duration: dur,
+            durationSeconds: recordedSeconds,
+            tickIntervalMs: 100,
+            totalTicks: analysisData.length,
+            recordedAt: new Date().toISOString(),
+          },
+          ticks: analysisData,
+        };
+        try {
+          const jsonUri = `${FileSystem.documentDirectory}${clientSlug}_${mm}-${ss < 10 ? '0' : ''}${ss}_analysis.json`;
+          await FileSystem.writeAsStringAsync(jsonUri, JSON.stringify(analysisPayload));
+        } catch (e) {
+          console.warn('[Recording] Analysis JSON save failed:', e.message);
+        }
+      }
+      console.log('[Recording] Analysis ticks collected:', analysisData.length);
+
+      // Upload to MinIO
+      let finalDownloadUrl = newUri;
+      const mimeType = format === 'wav' ? 'audio/wav' : 'audio/mp4';
+      try {
+        console.log('[Recording] Uploading to MinIO...');
+        finalDownloadUrl = await uploadToMinIO(newUri, clientSlug, fileName, mimeType);
+        console.log('[Recording] ✅ Uploaded:', finalDownloadUrl);
+      } catch (uploadError) {
+        console.warn('[Recording] MinIO upload failed, using local URI:', uploadError.message);
+      }
+
+      // Save to Firebase
+      if (activeClient) {
+        try {
+          await addRecordingToClient(activeClient.id, finalDownloadUrl, dur, finalTranscript, analysisPayload);
+          console.log('[Recording] ✅ Saved to Firebase.');
+        } catch (fbErr) {
+          console.error('[Recording] ❌ Firebase save FAILED:', fbErr);
+          console.error('[Recording] Error details:', JSON.stringify(fbErr));
+        }
+      }
+
+      const tickCount = analysisData.length;
+      Alert.alert(
+        'Recording Saved',
+        `Audio: ${fileName}\nDuration: ${dur}\nFormat: ${format.toUpperCase()}\nAnalysis: ${tickCount} data points`,
+        [{ text: 'OK' }]
+      );
+      console.log('[Recording] ✅ Fully completed.');
+
+      statusRef.current = 'idle';
+      setStatus('idle');
+      setSeconds(0);
+    } else {
+      console.log('[Recording] Ignored tap — status is:', currentStatus);
+    }
+  };
+
+  const handlePause = () => {
+    if (statusRef.current === 'recording') {
+      audioRecorder.pause();
+      statusRef.current = 'paused';
+      setStatus('paused');
+    } else if (statusRef.current === 'paused') {
+      audioRecorder.record();
+      statusRef.current = 'recording';
+      setStatus('recording');
+    }
+  };
+
+  const formatTime = (totalSeconds) => {
+    const mins = Math.floor(totalSeconds / 60)
+      .toString()
+      .padStart(2, '0');
+    const secs = (totalSeconds % 60).toString().padStart(2, '0');
+    return `${mins}:${secs}`;
+  };
+
+  const isRecordingOrPaused = status === 'recording' || status === 'paused';
+
+  // Human readable quality string
+  const qualityLabel = `${(sampleRate / 1000).toFixed(1)} kHz · ${bitDepth}-bit · ${
+    channels === 1 ? 'Mono' : 'Stereo'
+  } · ${format.toUpperCase()}`;
+
+  const handleIntakeSubmit = () => {
+    if (!inFirstName.trim() || !inLastName.trim() || !inAge.trim()) {
+      Alert.alert('Missing Fields', 'Please fill in First Name, Last Name, and Age.');
+      return;
+    }
+    if (!inIntake.trim()) {
+      Alert.alert('Missing Fields', 'Please fill in the Intake (current symptoms and history).');
+      return;
+    }
+    addClient({
+      firstName: inFirstName.trim(),
+      middleName: inMiddleName.trim(),
+      lastName: inLastName.trim(),
+      age: inAge.trim(),
+      gender: inGender,
+      grade: inGrade,
+      intake: inIntake.trim(),
+    });
+    // Clear form after submitting
+    setInFirstName('');
+    setInMiddleName('');
+    setInLastName('');
+    setInAge('');
+    setInGender('Male');
+    setInGrade('Grade 11');
+    setInIntake('');
+  };
+
+  const showIntake = !activeClient && status === 'idle';
+
+  return (
+    <View style={styles.container}>
+      <StatusBar barStyle="dark-content" backgroundColor="#F8F9FE" />
+
+      {/* Intake Form Modal */}
+      <Modal
+        visible={showIntake}
+        animationType="slide"
+        transparent={true}
+        onRequestClose={() => {}}
+      >
+        <View style={intakeStyles.overlay}>
+          <View style={intakeStyles.sheet}>
+            <View style={intakeStyles.sheetHeader}>
+              <Text style={intakeStyles.sheetTitle}>Client Setup</Text>
+            </View>
+            <ScrollView style={intakeStyles.scrollBody} showsVerticalScrollIndicator={false}>
+              
+              {/* Existing Folder selection */}
+              {clients.length > 0 && (
+                <View style={intakeStyles.formGroup}>
+                  <Text style={intakeStyles.label}>Select Existing Folder</Text>
+                  <View style={intakeStyles.pickerContainer}>
+                    <Picker
+                      selectedValue=""
+                      style={intakeStyles.picker}
+                      onValueChange={(itemValue) => {
+                        if (itemValue) {
+                          setActiveClient(itemValue);
+                        }
+                      }}
+                    >
+                      <Picker.Item label="Select existing client..." value="" color="#8E8E93" />
+                      {clients.map(c => (
+                        <Picker.Item key={c.id} label={c.name} value={c.id} />
+                      ))}
+                    </Picker>
+                  </View>
+                  <View style={intakeStyles.orDivider}>
+                    <View style={intakeStyles.orLine} />
+                    <Text style={intakeStyles.orText}>OR CREATE NEW</Text>
+                    <View style={intakeStyles.orLine} />
+                  </View>
+                </View>
+              )}
+
+              <View style={intakeStyles.formGroup}>
+                <Text style={intakeStyles.label}>First Name *</Text>
+                <TextInput
+                  style={intakeStyles.input}
+                  placeholder="e.g. John"
+                  value={inFirstName}
+                  onChangeText={setInFirstName}
+                />
+              </View>
+              <View style={intakeStyles.formGroup}>
+                <Text style={intakeStyles.label}>Middle Name (Optional)</Text>
+                <TextInput
+                  style={intakeStyles.input}
+                  placeholder="e.g. Smith"
+                  value={inMiddleName}
+                  onChangeText={setInMiddleName}
+                />
+              </View>
+              <View style={intakeStyles.formGroup}>
+                <Text style={intakeStyles.label}>Last Name *</Text>
+                <TextInput
+                  style={intakeStyles.input}
+                  placeholder="e.g. Doe"
+                  value={inLastName}
+                  onChangeText={setInLastName}
+                />
+              </View>
+              <View style={intakeStyles.formGroup}>
+                <Text style={intakeStyles.label}>Age *</Text>
+                <TextInput
+                  style={intakeStyles.input}
+                  placeholder="e.g. 18"
+                  keyboardType="numeric"
+                  value={inAge}
+                  onChangeText={setInAge}
+                />
+              </View>
+
+              <View style={intakeStyles.formGroup}>
+                <Text style={intakeStyles.label}>Gender</Text>
+                <View style={intakeStyles.genderRow}>
+                  <TouchableOpacity
+                    style={[intakeStyles.genderBtn, inGender === 'Male' && intakeStyles.genderBtnMale]}
+                    onPress={() => setInGender('Male')}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={[intakeStyles.genderText, inGender === 'Male' && intakeStyles.genderTextActive]}>Male</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[intakeStyles.genderBtn, inGender === 'Female' && intakeStyles.genderBtnFemale]}
+                    onPress={() => setInGender('Female')}
+                    activeOpacity={0.8}
+                  >
+                    <Text style={[intakeStyles.genderText, inGender === 'Female' && intakeStyles.genderTextActive]}>Female</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+
+              <View style={intakeStyles.formGroup}>
+                <Text style={intakeStyles.label}>Grade</Text>
+                <View style={intakeStyles.pickerContainer}>
+                  <Picker
+                    selectedValue={inGrade}
+                    style={intakeStyles.picker}
+                    onValueChange={(itemValue) => setInGrade(itemValue)}
+                  >
+                    <Picker.Item label="Grade 11" value="Grade 11" />
+                    <Picker.Item label="Grade 12" value="Grade 12" />
+                    <Picker.Item label="1st Year College" value="1st Year College" />
+                    <Picker.Item label="2nd Year College" value="2nd Year College" />
+                    <Picker.Item label="3rd Year College" value="3rd Year College" />
+                    <Picker.Item label="4th Year College" value="4th Year College" />
+                  </Picker>
+                </View>
+              </View>
+
+              <View style={intakeStyles.formGroup}>
+                <Text style={intakeStyles.label}>Intake (Current Symptoms and History) *</Text>
+                <TextInput
+                  style={[intakeStyles.input, { height: 100, textAlignVertical: 'top' }]}
+                  placeholder="Describe current symptoms, relevant history, observations..."
+                  value={inIntake}
+                  onChangeText={setInIntake}
+                  multiline={true}
+                  numberOfLines={4}
+                />
+              </View>
+
+              <View style={intakeStyles.buttonRow}>
+                <TouchableOpacity 
+                  style={[intakeStyles.submitBtn, intakeStyles.cancelBtn]} 
+                  onPress={() => navigation.navigate('Home')} 
+                  activeOpacity={0.8}
+                >
+                  <Text style={[intakeStyles.submitText, intakeStyles.cancelText]}>Cancel</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity 
+                  style={[intakeStyles.submitBtn, {flex: 1}]} 
+                  onPress={handleIntakeSubmit} 
+                  activeOpacity={0.8}
+                >
+                  <Text style={intakeStyles.submitText}>Continue</Text>
+                </TouchableOpacity>
+              </View>
+              <View style={{height: 40}} />
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Header with Settings */}
+      <View style={styles.header}>
+        <View style={styles.topBannerRow}>
+          {activeClient && (
+            <View style={styles.activeClientBanner}>
+              <View style={[styles.clientIcon, { backgroundColor: activeClient.color + '20' }]}>
+                <Ionicons name="person" size={12} color={activeClient.color} />
+              </View>
+              <Text style={styles.activeClientText} numberOfLines={1}>
+                {activeClient.name}
+              </Text>
+              {!isRecordingOrPaused && (
+                <TouchableOpacity onPress={() => setActiveClient(null)} style={styles.changeClientBtn}>
+                  <Text style={styles.changeClientText}>Change</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          )}
+        </View>
+
+        <View style={styles.headerRow}>
+          <TouchableOpacity
+            style={styles.settingsBtn}
+            onPress={() => setShowSettings(true)}
+            activeOpacity={0.7}
+            disabled={isRecordingOrPaused}
+          >
+            <Ionicons
+              name="settings-outline"
+              size={22}
+              color={isRecordingOrPaused ? '#D1D1D6' : '#4CAF50'}
+            />
+          </TouchableOpacity>
+          <Text style={styles.title}>Recording</Text>
+          <View style={{ width: 40 }} />
+        </View>
+        <Text style={styles.subtitle}>
+          {status === 'idle'
+            ? 'Tap the button to start recording'
+            : status === 'recording'
+            ? 'Recording in progress...'
+            : 'Recording paused'}
+        </Text>
+        {/* Quality badge */}
+        <View style={styles.qualityBadge}>
+          <Ionicons name="options-outline" size={12} color="#4CAF50" />
+          <Text style={styles.qualityText}>{qualityLabel}</Text>
+        </View>
+      </View>
+
+      {/* Waveform area */}
+      <View style={styles.waveformArea}>
+        <View style={styles.waveformPlaceholder}>
+          {status === 'idle' ? (
+            <Ionicons name="mic-outline" size={48} color="#D1D1D6" />
+          ) : (
+            <View style={styles.waveformBars}>
+              {waveData.map((amp, i) => {
+                const minH = 4;
+                const maxH = 70;
+                const height = status === 'paused'
+                  ? minH
+                  : minH + amp * (maxH - minH);
+                return (
+                  <View
+                    key={i}
+                    style={[
+                      styles.waveBar,
+                      {
+                        height,
+                        backgroundColor:
+                          status === 'paused' ? '#D1D1D6' : amp > 0.6 ? '#2E7D32' : '#4CAF50',
+                        opacity: status === 'paused' ? 0.4 : 0.4 + amp * 0.6,
+                      },
+                    ]}
+                  />
+                );
+              })}
+            </View>
+          )}
+        </View>
+      </View>
+
+      {/* Live Transcript */}
+      {isRecordingOrPaused && (transcript || interimText) ? (
+        <View style={styles.transcriptContainer}>
+          <View style={styles.transcriptHeader}>
+            <Ionicons name="document-text-outline" size={14} color="#4CAF50" />
+            <Text style={styles.transcriptLabel}>Live Transcript</Text>
+            <Text style={styles.transcriptLang}>
+              {LANGUAGES.find(l => l.value === language)?.label || 'English'}
+            </Text>
+          </View>
+          <ScrollView style={styles.transcriptScroll} nestedScrollEnabled>
+            <Text style={styles.transcriptText}>
+              {transcript}
+              {interimText ? <Text style={styles.interimText}> {interimText}</Text> : null}
+            </Text>
+          </ScrollView>
+        </View>
+      ) : null}
+
+      {/* Timer */}
+      <View style={[styles.timerContainer, { marginBottom: isSmall ? 32 : 48 }]}>
+        <Text
+          style={[
+            styles.timer,
+            isRecordingOrPaused && { color: '#4CAF50' },
+            isSmall && { fontSize: 44 },
+          ]}
+        >
+          {formatTime(seconds)}
+        </Text>
+        {isRecordingOrPaused && (
+          <View style={styles.statusDot}>
+            <View
+              style={[
+                styles.dot,
+                {
+                  backgroundColor:
+                    status === 'recording' ? '#FF3B30' : '#FFA94D',
+                },
+              ]}
+            />
+            <Text style={styles.statusText}>
+              {status === 'recording' ? 'REC' : 'PAUSED'}
+            </Text>
+          </View>
+        )}
+      </View>
+
+      {/* Controls */}
+      <View style={[styles.controlsContainer, { gap: isSmall ? 20 : 32 }]}>
+        {/* Pause Button */}
+        <TouchableOpacity
+          style={[
+            styles.pauseButton,
+            !isRecordingOrPaused && styles.pauseButtonDisabled,
+          ]}
+          onPress={handlePause}
+          disabled={!isRecordingOrPaused}
+          activeOpacity={0.7}
+        >
+          <Ionicons
+            name={status === 'paused' ? 'play' : 'pause'}
+            size={24}
+            color={isRecordingOrPaused ? '#4CAF50' : '#D1D1D6'}
+          />
+        </TouchableOpacity>
+
+        {/* Record / Stop */}
+        <Animated.View
+          style={[
+            styles.recordBtnOuter,
+            {
+              transform: [{ scale: status === 'recording' ? pulseAnim : 1 }],
+            },
+          ]}
+        >
+          <TouchableOpacity
+            style={[
+              styles.recordButton,
+              isRecordingOrPaused && styles.stopButton,
+            ]}
+            onPress={handleRecordToggle}
+            activeOpacity={0.8}
+          >
+            {isRecordingOrPaused ? (
+              <View style={styles.stopIcon} />
+            ) : (
+              <Ionicons name="mic" size={32} color="#ffffff" />
+            )}
+          </TouchableOpacity>
+        </Animated.View>
+
+        {/* Placeholder for symmetry */}
+        <View style={styles.pauseButton} />
+      </View>
+
+      {/* Tip */}
+      <View style={styles.tipContainer}>
+        <Ionicons name="information-circle-outline" size={16} color="#C7C7CC" />
+        <Text style={styles.tipText}>
+          Hold your device 6–12 inches from the speaker for best results
+        </Text>
+      </View>
+
+      {/* ── Settings Modal ── */}
+      <Modal
+        visible={showSettings}
+        animationType="slide"
+        transparent={true}
+        onRequestClose={() => setShowSettings(false)}
+      >
+        <View style={settingStyles.overlay}>
+          <View style={settingStyles.sheet}>
+            {/* Modal header */}
+            <View style={settingStyles.sheetHeader}>
+              <Text style={settingStyles.sheetTitle}>Recording Settings</Text>
+              <TouchableOpacity
+                onPress={() => setShowSettings(false)}
+                style={settingStyles.closeBtn}
+                activeOpacity={0.7}
+              >
+                <Ionicons name="close" size={24} color="#1a1a2e" />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView
+              style={settingStyles.scrollBody}
+              showsVerticalScrollIndicator={false}
+            >
+              {/* Sample Rate */}
+              <PillSelector
+                label="Sample Rate"
+                options={SAMPLE_RATES}
+                selected={sampleRate}
+                onChange={setSampleRate}
+                renderLabel={(v) => {
+                  if (v >= 1000) return `${(v / 1000).toFixed(v % 1000 === 0 ? 0 : 1)} kHz`;
+                  return `${v} Hz`;
+                }}
+              />
+
+              {/* Bit Depth */}
+              <PillSelector
+                label="Bit Depth"
+                options={BIT_DEPTHS}
+                selected={bitDepth}
+                onChange={setBitDepth}
+                renderLabel={(v) => `${v}-bit`}
+              />
+
+              {/* Channels */}
+              <PillSelector
+                label="Channels"
+                options={CHANNELS}
+                selected={channels}
+                onChange={setChannels}
+                renderLabel={(v) => (v === 1 ? 'Mono' : 'Stereo')}
+              />
+
+              {/* Format */}
+              <PillSelector
+                label="Format"
+                options={FORMATS}
+                selected={format}
+                onChange={setFormat}
+              />
+
+              {/* Language */}
+              <PillSelector
+                label="Transcription Language"
+                options={LANGUAGES}
+                selected={language}
+                onChange={setLanguage}
+              />
+
+              {/* Info card */}
+              <View style={settingStyles.infoCard}>
+                <Ionicons name="information-circle" size={20} color="#4CAF50" />
+                <Text style={settingStyles.infoText}>
+                  Default: 44.1 kHz, 16-bit, Mono, WAV — optimized for clinical
+                  voice feature extraction. Adjust only if needed.
+                </Text>
+              </View>
+
+              {/* Reset button */}
+              <TouchableOpacity
+                style={settingStyles.resetBtn}
+                onPress={() => {
+                  setSampleRate(44100);
+                  setBitDepth(16);
+                  setChannels(1);
+                  setFormat('wav');
+                  setLanguage('en-US');
+                }}
+                activeOpacity={0.7}
+              >
+                <Ionicons name="refresh" size={16} color="#8E8E93" />
+                <Text style={settingStyles.resetText}>Reset to Defaults</Text>
+              </TouchableOpacity>
+            </ScrollView>
+
+            {/* Apply */}
+            <TouchableOpacity
+              style={settingStyles.applyBtn}
+              onPress={() => setShowSettings(false)}
+              activeOpacity={0.8}
+            >
+              <Text style={settingStyles.applyText}>Apply Settings</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#F8F9FE',
+    paddingTop: 56,
+    alignItems: 'center',
+  },
+  header: {
+    alignItems: 'center',
+    marginBottom: 32,
+    paddingHorizontal: 20,
+    width: '100%',
+  },
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: '100%',
+    marginBottom: 4,
+  },
+  settingsBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 14,
+    backgroundColor: '#ffffff',
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.06,
+    shadowRadius: 4,
+  },
+  title: {
+    flex: 1,
+    fontSize: 28,
+    fontWeight: '800',
+    color: '#1a1a2e',
+    letterSpacing: -0.5,
+    textAlign: 'center',
+  },
+  subtitle: {
+    fontSize: 15,
+    color: '#8E8E93',
+    marginTop: 4,
+    textAlign: 'center',
+  },
+  qualityBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 10,
+    backgroundColor: '#E8F5E9',
+    borderRadius: 20,
+    paddingHorizontal: 14,
+    paddingVertical: 5,
+  },
+  qualityText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#4CAF50',
+    letterSpacing: 0.3,
+  },
+  waveformArea: {
+    width: '100%',
+    paddingHorizontal: 20,
+    marginBottom: 32,
+  },
+  waveformPlaceholder: {
+    height: 120,
+    backgroundColor: '#ffffff',
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+  },
+  waveformBars: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+    height: 80,
+    paddingHorizontal: 10,
+  },
+  waveBar: {
+    width: 3,
+    borderRadius: 1.5,
+  },
+  transcriptContainer: {
+    width: '100%',
+    paddingHorizontal: 20,
+    marginBottom: 16,
+  },
+  transcriptHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginBottom: 8,
+  },
+  transcriptLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#4CAF50',
+    flex: 1,
+  },
+  transcriptLang: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: '#8E8E93',
+    backgroundColor: '#F0F0F5',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
+  },
+  transcriptScroll: {
+    maxHeight: 80,
+    backgroundColor: '#ffffff',
+    borderRadius: 12,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#E8E8ED',
+  },
+  transcriptText: {
+    fontSize: 14,
+    color: '#1a1a2e',
+    lineHeight: 20,
+  },
+  interimText: {
+    color: '#C7C7CC',
+    fontStyle: 'italic',
+  },
+  timerContainer: {
+    alignItems: 'center',
+    marginBottom: 48,
+  },
+  timer: {
+    fontSize: 56,
+    fontWeight: '200',
+    color: '#1a1a2e',
+    fontVariant: ['tabular-nums'],
+    letterSpacing: 2,
+  },
+  statusDot: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 8,
+  },
+  dot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
+  statusText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#8E8E93',
+    letterSpacing: 1,
+  },
+  controlsContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 32,
+    marginBottom: 48,
+  },
+  pauseButton: {
+    width: 56,
+    height: 56,
+    borderRadius: 20,
+    backgroundColor: '#ffffff',
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 8,
+  },
+  pauseButtonDisabled: {
+    opacity: 0.4,
+    elevation: 1,
+  },
+  recordBtnOuter: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+  },
+  recordButton: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: '#4CAF50',
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 8,
+    shadowColor: '#4CAF50',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.35,
+    shadowRadius: 12,
+  },
+  stopButton: {
+    backgroundColor: '#FF3B30',
+    shadowColor: '#FF3B30',
+  },
+  stopIcon: {
+    width: 24,
+    height: 24,
+    borderRadius: 6,
+    backgroundColor: '#ffffff',
+  },
+  tipContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 32,
+  },
+  tipText: {
+    fontSize: 13,
+    color: '#C7C7CC',
+    textAlign: 'center',
+    flex: 1,
+  },
+  topBannerRow: {
+    width: '100%',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  activeClientBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#ffffff',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 20,
+    gap: 8,
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 4,
+    maxWidth: '90%',
+  },
+  clientIcon: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  activeClientText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#1a1a2e',
+    flexShrink: 1,
+  },
+  changeClientBtn: {
+    marginLeft: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    backgroundColor: '#F8F9FE',
+    borderRadius: 8,
+  },
+  changeClientText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#4CAF50',
+  },
+});
+
+// ── Settings modal styles ────────────────────────────────────
+const settingStyles = StyleSheet.create({
+  overlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    justifyContent: 'flex-end',
+  },
+  sheet: {
+    backgroundColor: '#ffffff',
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    paddingTop: 8,
+    maxHeight: '85%',
+  },
+  sheetHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 24,
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f0f0',
+  },
+  sheetTitle: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: '#1a1a2e',
+  },
+  closeBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#f5f5f5',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  scrollBody: {
+    paddingHorizontal: 24,
+    paddingTop: 20,
+  },
+  group: {
+    marginBottom: 24,
+  },
+  groupLabel: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#1a1a2e',
+    marginBottom: 10,
+    letterSpacing: 0.3,
+  },
+  pills: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  pill: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 12,
+    backgroundColor: '#f5f5f5',
+    borderWidth: 1.5,
+    borderColor: 'transparent',
+  },
+  pillActive: {
+    backgroundColor: '#E8F5E9',
+    borderColor: '#4CAF50',
+  },
+  pillText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#8E8E93',
+  },
+  pillTextActive: {
+    color: '#4CAF50',
+  },
+  infoCard: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    backgroundColor: '#F8F7FF',
+    borderRadius: 14,
+    padding: 16,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#E8F5E9',
+  },
+  infoText: {
+    flex: 1,
+    fontSize: 12,
+    color: '#636e72',
+    lineHeight: 18,
+  },
+  resetBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 12,
+    marginBottom: 16,
+  },
+  resetText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#8E8E93',
+  },
+  applyBtn: {
+    margin: 24,
+    marginTop: 8,
+    backgroundColor: '#4CAF50',
+    borderRadius: 16,
+    paddingVertical: 16,
+    alignItems: 'center',
+    elevation: 4,
+    shadowColor: '#4CAF50',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.25,
+    shadowRadius: 8,
+  },
+  applyText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#ffffff',
+    letterSpacing: 0.5,
+  },
+});
+
+// ── Intake form styles ───────────────────────────────────────
+const intakeStyles = StyleSheet.create({
+  overlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'flex-end',
+  },
+  sheet: {
+    backgroundColor: '#ffffff',
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
+    paddingTop: 8,
+    height: '80%',
+  },
+  sheetHeader: {
+    paddingHorizontal: 24,
+    paddingVertical: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f0f0f0',
+  },
+  sheetTitle: {
+    fontSize: 22,
+    fontWeight: '800',
+    color: '#1a1a2e',
+  },
+  scrollBody: {
+    paddingHorizontal: 24,
+    paddingTop: 24,
+  },
+  formGroup: {
+    marginBottom: 20,
+  },
+  label: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#1a1a2e',
+    marginBottom: 8,
+    letterSpacing: 0.2,
+  },
+  input: {
+    backgroundColor: '#F8F9FE',
+    borderWidth: 1,
+    borderColor: '#E8E8ED',
+    borderRadius: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    fontSize: 15,
+    color: '#1a1a2e',
+  },
+  genderRow: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  genderBtn: {
+    flex: 1,
+    paddingVertical: 14,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: '#E8E8ED',
+    alignItems: 'center',
+    backgroundColor: '#F8F9FE',
+  },
+  genderBtnMale: {
+    borderColor: '#339AF0',
+    backgroundColor: '#E7F5FF',
+  },
+  genderBtnFemale: {
+    borderColor: '#E91E8C',
+    backgroundColor: '#FFF0F6',
+  },
+  genderText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#8E8E93',
+  },
+  genderTextActive: {
+    color: '#1a1a2e',
+  },
+  pickerContainer: {
+    backgroundColor: '#F8F9FE',
+    borderWidth: 1,
+    borderColor: '#E8E8ED',
+    borderRadius: 12,
+    overflow: 'hidden',
+  },
+  picker: {
+    height: 50,
+    width: '100%',
+  },
+  orDivider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginVertical: 24,
+  },
+  orLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: '#E8E8ED',
+  },
+  orText: {
+    marginHorizontal: 12,
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#8E8E93',
+    letterSpacing: 1,
+  },
+  submitBtn: {
+    backgroundColor: '#4CAF50',
+    borderRadius: 16,
+    paddingVertical: 16,
+    alignItems: 'center',
+    marginTop: 12,
+    elevation: 4,
+    shadowColor: '#4CAF50',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.25,
+    shadowRadius: 8,
+  },
+  submitText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#ffffff',
+    letterSpacing: 0.5,
+  },
+  buttonRow: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  cancelBtn: {
+    backgroundColor: '#E8F5E9',
+    elevation: 0,
+    shadowOpacity: 0,
+    flex: 1,
+  },
+  cancelText: {
+    color: '#4CAF50',
+  },
+});

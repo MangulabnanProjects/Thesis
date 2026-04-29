@@ -1,0 +1,438 @@
+/* ===== Room Page ===== */
+.room {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding-bottom: 24px;
+}
+
+/* ===== Waveform Card ===== */
+.room__waveform-card {
+  background: var(--white);
+  border-radius: 14px;
+  padding: 24px 28px;
+  border: 1px solid var(--border-light);
+  box-shadow: var(--shadow-sm);
+}
+
+.room__waveform-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+.room__title {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.room__duration {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--gray-500);
+  background: var(--gray-100);
+  padding: 4px 12px;
+  border-radius: 20px;
+  display: inline-block;
+}
+
+.room__analytics-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background-color: var(--primary-50);
+  color: var(--primary-600);
+  border: 1px solid var(--primary-200);
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.room__analytics-btn:hover {
+  background-color: var(--primary-100);
+  border-color: var(--primary-300);
+}
+
+.room__waveform-display {
+  position: relative;
+  height: 120px;
+  background: var(--gray-50);
+  border: 1px solid var(--gray-200);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+
+.room__waveform-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.room__playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--primary-600);
+  transition: left 0.3s ease;
+  z-index: 2;
+}
+
+.room__playhead::after {
+  content: '';
+  position: absolute;
+  top: -4px;
+  left: -5px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--primary-600);
+  border: 2px solid var(--white);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+}
+
+/* ===== Player Controls ===== */
+.room__controls {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 20px;
+  margin-bottom: 12px;
+}
+
+.room__control-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: none;
+  color: var(--gray-500);
+  font-size: 0.75rem;
+  cursor: pointer;
+  padding: 6px 10px;
+  border-radius: 8px;
+  transition: all 0.2s ease;
+}
+
+.room__control-btn:hover {
+  background: var(--gray-100);
+  color: var(--text-primary);
+}
+
+.room__control-label {
+  font-weight: 600;
+  font-size: 0.7rem;
+}
+
+.room__play-btn {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--primary-500);
+  color: var(--white);
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(76, 175, 80, 0.35);
+  transition: all 0.2s ease;
+}
+
+.room__play-btn:hover {
+  background: var(--primary-600);
+  transform: scale(1.08);
+  box-shadow: 0 4px 14px rgba(76, 175, 80, 0.4);
+}
+
+/* ===== Progress Bar ===== */
+.room__progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.room__time {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--gray-500);
+  min-width: 32px;
+}
+
+.room__progress-track {
+  flex: 1;
+  height: 6px;
+  background: var(--gray-200);
+  border-radius: 3px;
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+}
+
+.room__progress-fill {
+  height: 100%;
+  background: var(--primary-500);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+/* ===== Cards ===== */
+.room__card {
+  background: var(--white);
+  border-radius: 14px;
+  padding: 24px 28px;
+  border: 1px solid var(--border-light);
+  box-shadow: var(--shadow-sm);
+}
+
+.room__card-title {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ===== Transcription ===== */
+.room__transcript-full {
+  font-size: 0.9rem;
+  line-height: 1.75;
+  color: var(--text-primary);
+  padding: 16px 18px;
+  background: var(--gray-50);
+  border-radius: 10px;
+  margin-bottom: 16px;
+}
+
+.room__transcription {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.room__transcript-text {
+  font-size: 0.88rem;
+  line-height: 1.65;
+  color: var(--text-secondary);
+  padding: 10px 14px;
+  background: var(--gray-50);
+  border-radius: 8px;
+  border-left: 3px solid var(--primary-300);
+}
+
+.room__transcript-time {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--primary-600);
+  margin-right: 8px;
+}
+
+/* ===== Analysis Results ===== */
+.room__results-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+.room__result-item {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 18px 20px;
+  background: var(--gray-50);
+  border-radius: 12px;
+  border: 1px solid var(--border-light);
+}
+
+.room__result-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.room__result-icon--orange {
+  background: #fff3e0;
+  color: #ff9800;
+}
+
+.room__result-icon--blue {
+  background: #e3f2fd;
+  color: #4285f4;
+}
+
+.room__result-icon--purple {
+  background: #f3e5f5;
+  color: #9c27b0;
+}
+
+.room__result-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.room__result-label {
+  font-size: 0.75rem;
+  color: var(--gray-500);
+  font-weight: 500;
+}
+
+.room__result-value {
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.room__result-value--orange { color: #ff9800; }
+.room__result-value--blue { color: #4285f4; }
+.room__result-value--purple { color: #9c27b0; }
+.room__result-value--red { color: #c62828; }
+.room__result-value--green { color: #2e7d32; }
+
+/* ===== AI Model Confidence ===== */
+.room__confidence {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.room__confidence-track {
+  width: 100%;
+  height: 28px;
+  background: var(--gray-100);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.room__confidence-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #4caf50, #66bb6a);
+  border-radius: 14px;
+  transition: width 1s ease;
+}
+
+.room__confidence-info {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.room__confidence-percent {
+  font-size: 1.6rem;
+  font-weight: 800;
+  color: #4caf50;
+}
+
+.room__confidence-label {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+
+/* ===== Mobile Responsive ===== */
+@media (max-width: 768px) {
+  .room__waveform-card,
+  .room__card {
+    padding: 16px;
+  }
+  .room__title {
+    font-size: 0.88rem;
+  }
+  .room__results-grid {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .room__waveform-display {
+    height: 90px;
+  }
+}
+
+/* ===== Empty State ===== */
+.room__empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 80px 40px;
+  text-align: center;
+  background: var(--white);
+  border-radius: 14px;
+  border: 2px dashed var(--gray-200);
+}
+
+.room__empty-icon {
+  margin-bottom: 20px;
+  opacity: 0.5;
+}
+
+.room__empty-title {
+  font-size: 1.3rem;
+  font-weight: 700;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+
+.room__empty-desc {
+  font-size: 0.95rem;
+  color: var(--gray-400);
+  max-width: 420px;
+  line-height: 1.6;
+}
+
+/* ===== Person/Folder Name ===== */
+.room__person-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--primary-600);
+  background: var(--primary-50);
+  border: 1px solid var(--primary-200);
+  padding: 3px 10px;
+  border-radius: 20px;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* ===== Audio Error Banner ===== */
+.room__audio-error {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: #fff3e0;
+  color: #e65100;
+  border: 1px solid #ffe0b2;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+/* ===== Loading Spinner ===== */
+.room__play-btn--loading {
+  opacity: 0.7;
+  cursor: wait;
+}
+
+.room__spinner {
+  animation: roomSpin 1s linear infinite;
+}
+
+@keyframes roomSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
