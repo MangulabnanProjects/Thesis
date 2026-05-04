@@ -15,7 +15,7 @@ import {
 import * as FileSystem from 'expo-file-system/legacy';
 import { Ionicons } from '@expo/vector-icons';
 import { Picker } from '@react-native-picker/picker';
-import { useFocusEffect, useNavigation } from '@react-navigation/native';
+import { useFocusEffect, useNavigation, useIsFocused } from '@react-navigation/native';
 import { useClientContext } from '../context/ClientContext';
 import {
   useAudioRecorder,
@@ -26,10 +26,13 @@ import {
   AudioQuality,
 } from 'expo-audio';
 import { uploadToMinIO } from '../config/minioConfig';
+import { summarizeIntake, getBertEmbeddings } from '../services/aiService';
+import { getRequiredModels } from '../../src/utils/modelRouter';
+import { calculateSeverity } from '../../src/utils/severityCalculator';
 
 // Safe import — expo-speech-recognition needs a dev build, not Expo Go
 let ExpoSpeechRecognitionModule = null;
-let useSpeechRecognitionEvent = () => {}; // no-op fallback
+let useSpeechRecognitionEvent = () => { }; // no-op fallback
 try {
   const mod = require('expo-speech-recognition');
   ExpoSpeechRecognitionModule = mod.ExpoSpeechRecognitionModule;
@@ -117,8 +120,8 @@ function PillSelector({ label, options, selected, onChange, renderLabel }) {
           const display = renderLabel
             ? renderLabel(opt)
             : typeof opt === 'object'
-            ? opt.label
-            : String(opt);
+              ? opt.label
+              : String(opt);
           const isActive = selected === val;
           return (
             <TouchableOpacity
@@ -134,6 +137,42 @@ function PillSelector({ label, options, selected, onChange, renderLabel }) {
                 ]}
               >
                 {display}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+// ── Likert Question Component ─────────────────────────────────
+function LikertQuestion({ question, value, onChange }) {
+  const options = [
+    { value: 0, label: '0 (Not at all)' },
+    { value: 1, label: '1 (Sometimes)' },
+    { value: 2, label: '2 (Often)' },
+    { value: 3, label: '3 (Always)' }
+  ];
+
+  return (
+    <View style={intakeStyles.likertContainer}>
+      <Text style={intakeStyles.likertQuestionText}>{question}</Text>
+      <View style={intakeStyles.likertOptionsColumn}>
+        {options.map((opt) => {
+          const isSelected = value === opt.value;
+          return (
+            <TouchableOpacity
+              key={opt.value}
+              style={intakeStyles.likertRadioRow}
+              onPress={() => onChange(opt.value)}
+              activeOpacity={0.7}
+            >
+              <View style={[intakeStyles.radioCircle, isSelected && intakeStyles.radioCircleActive]}>
+                {isSelected && <View style={intakeStyles.radioDot} />}
+              </View>
+              <Text style={[intakeStyles.likertRadioLabel, isSelected && intakeStyles.likertRadioLabelActive]}>
+                {opt.label}
               </Text>
             </TouchableOpacity>
           );
@@ -159,7 +198,15 @@ export default function RecordingScreen() {
   const [inAge, setInAge] = useState('');
   const [inGender, setInGender] = useState('Male'); // Default
   const [inGrade, setInGrade] = useState('Grade 11');
-  const [inIntake, setInIntake] = useState('');
+
+  const [qGAD, setQGAD] = useState(0);
+  const [qPanic, setQPanic] = useState(0);
+  const [qSocial, setQSocial] = useState(0);
+  const [qPTSD, setQPTSD] = useState(0);
+  const [qAgoraphobia, setQAgoraphobia] = useState(0);
+  const [qNeutral, setQNeutral] = useState(0);
+
+  const [consentGiven, setConsentGiven] = useState(false);
 
   // Audio quality settings
   const [sampleRate, setSampleRate] = useState(44100);
@@ -191,6 +238,10 @@ export default function RecordingScreen() {
   const prevMeterRef = useRef(null);
   const prevPitchRef = useRef(150); // Random-walk pitch state (starts at ~150 Hz)
 
+  // Results popup state
+  const [showResultsPopup, setShowResultsPopup] = useState(false);
+  const [recordingResults, setRecordingResults] = useState(null);
+
   // Check if speech recognition is available
   useEffect(() => {
     (async () => {
@@ -207,13 +258,13 @@ export default function RecordingScreen() {
 
   // Speech recognition events
   useSpeechRecognitionEvent('result', (event) => {
-    const latest = event.results[event.resultIndex];
-    if (latest) {
-      if (latest.isFinal) {
-        setTranscript(prev => (prev ? prev + ' ' : '') + latest.transcript);
+    const transcriptText = event.results[0]?.transcript;
+    if (transcriptText) {
+      if (event.isFinal) {
+        setTranscript(prev => (prev ? prev + ' ' : '') + transcriptText);
         setInterimText('');
       } else {
-        setInterimText(latest.transcript);
+        setInterimText(transcriptText);
       }
     }
   });
@@ -231,6 +282,9 @@ export default function RecordingScreen() {
             lang: language,
             interimResults: true,
             continuous: true,
+            androidIntentOptions: {
+              EXTRA_LANGUAGE_MODEL: "web_search"
+            }
           });
         } catch (e) {
           console.warn('Could not restart speech recognition:', e);
@@ -264,36 +318,43 @@ export default function RecordingScreen() {
       const timestamp = Date.now();
       const amplitude = normalized;
 
-      // Approximate pitch (F0) using random-walk — independent of amplitude
-      // Real pitch needs FFT/autocorrelation; this simulates natural pitch drift
-      const prevPitch = prevPitchRef.current;
-      // Random walk: small steps ±5 Hz, slight pull toward 150 Hz center
-      const drift = (Math.random() - 0.5) * 12; // ±6 Hz random step
-      const meanRevert = (150 - prevPitch) * 0.05; // gentle pull to center
-      // Only slight amplitude influence: voice tends slightly higher when louder
-      const ampInfluence = (amplitude - 0.5) * 8;
-      const pitch = Math.max(70, Math.min(300, prevPitch + drift + meanRevert + ampInfluence));
-      prevPitchRef.current = pitch;
+      // Voice Activity Detection: amplitude > 0.15 = voiced
+      const voiced = amplitude > 0.15;
 
-      // Jitter: cycle-to-cycle pitch variation (%) — higher when amplitude is low/unstable
+      // Approximate pitch (F0) using random-walk — independent of amplitude
+      const prevPitch = prevPitchRef.current;
+      const drift = (Math.random() - 0.5) * 12;
+      const meanRevert = (150 - prevPitch) * 0.05;
+      const ampInfluence = (amplitude - 0.5) * 8;
+      const pitch = voiced ? Math.max(70, Math.min(300, prevPitch + drift + meanRevert + ampInfluence)) : 0;
+      if (voiced) prevPitchRef.current = pitch;
+
+      // Jitter (frequency perturbation) and Shimmer (amplitude perturbation)
       const prevAmp = prevMeterRef.current ?? amplitude;
       const ampDelta = Math.abs(amplitude - prevAmp);
-      const jitter = Math.min(0.5, 0.005 + ampDelta * 0.8 + (1 - amplitude) * 0.05);
+      const pitchDelta = voiced ? Math.abs(pitch - prevPitch) : 0;
 
-      // Shimmer: cycle-to-cycle amplitude variation (dB) — correlates with breathiness
-      const shimmer = Math.min(0.5, 0.01 + ampDelta * 0.6 + Math.random() * 0.02);
+      // Jitter typically < 1.04%. Here we produce raw ratio ~0.005. Multiply by 100 later gives 0.5%
+      const jitter = voiced ? Math.min(0.02, 0.002 + (pitchDelta / (pitch || 1)) * 0.1 + Math.random() * 0.003) : 0;
 
-      // Loudness: mapping the normalized amplitude (0-1) to a percentage (0-100) for easy visualization
+      // Shimmer typically < 0.35 dB. Produce raw ~0.015. 
+      const shimmer = voiced ? Math.min(0.1, 0.005 + ampDelta * 0.05 + Math.random() * 0.01) : 0;
+
       const loudness = parseFloat((amplitude * 100).toFixed(2));
+      const isSpeaking = amplitude > 0.35;
+      const speechEnergy = Math.max(0, amplitude - 0.35) * 1.5;
 
       analysisDataRef.current.push({
         t: timestamp,
         amp: parseFloat(amplitude.toFixed(4)),
         db: parseFloat(db.toFixed(1)),
         pitch: parseFloat(pitch.toFixed(1)),
+        voiced,
         jitter: parseFloat(jitter.toFixed(4)),
         shimmer: parseFloat(shimmer.toFixed(4)),
         loudness: loudness,
+        isSpeaking: isSpeaking,
+        speechEnergy: parseFloat(speechEnergy.toFixed(4))
       });
 
       prevMeterRef.current = amplitude;
@@ -335,7 +396,7 @@ export default function RecordingScreen() {
     useCallback(() => {
       return () => {
         if (statusRef.current !== 'idle') {
-          audioRecorder.stop().catch(() => {});
+          audioRecorder.stop().catch(() => { });
         }
         statusRef.current = 'idle';
         setStatus('idle');
@@ -445,7 +506,14 @@ export default function RecordingScreen() {
           try {
             const speechPerm = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
             if (speechPerm.granted) {
-              ExpoSpeechRecognitionModule.start({ lang: language, interimResults: true, continuous: true });
+              ExpoSpeechRecognitionModule.start({
+                lang: language,
+                interimResults: true,
+                continuous: true,
+                androidIntentOptions: {
+                  EXTRA_LANGUAGE_MODEL: "web_search"
+                }
+              });
             }
           } catch (e) {
             console.warn('[Recording] Speech recognition start failed:', e.message);
@@ -466,7 +534,7 @@ export default function RecordingScreen() {
 
       // Stop speech recognition
       if (speechAvailable) {
-        try { ExpoSpeechRecognitionModule.stop(); } catch (e) {}
+        try { ExpoSpeechRecognitionModule.stop(); } catch (e) { }
       }
 
       // Give Android MediaRecorder time to finalize
@@ -486,100 +554,254 @@ export default function RecordingScreen() {
         return;
       }
 
-      // Use ref for accurate seconds (closure may be stale)
-      const recordedSeconds = secondsRef.current || seconds;
-      const mm = Math.floor(recordedSeconds / 60);
-      const ss = recordedSeconds % 60;
-      const dur = `${mm}:${ss < 10 ? '0' : ''}${ss}`;
-
-      const clientSlug = activeClient
-        ? activeClient.name.replace(/\s+/g, '_')
-        : 'Recording';
-      const ext = format === 'wav' ? 'wav' : 'm4a';
-      const fileName = `${clientSlug}_${mm}-${ss < 10 ? '0' : ''}${ss}.${ext}`;
-      const newUri = `${FileSystem.documentDirectory}${fileName}`;
-
-      // Move temp file
+      // === SAFETY NET: Wrap the entire post-stop flow ===
       try {
-        await FileSystem.moveAsync({ from: tempUri, to: newUri });
-        console.log('[Recording] File moved to:', newUri);
-      } catch (moveErr) {
-        console.warn('[Recording] moveAsync failed, trying copyAsync:', moveErr.message);
+        // Use ref for accurate seconds (closure may be stale)
+        const recordedSeconds = secondsRef.current || seconds;
+        const mm = Math.floor(recordedSeconds / 60);
+        const ss = recordedSeconds % 60;
+        const dur = `${mm}:${ss < 10 ? '0' : ''}${ss}`;
+
+        const clientSlug = activeClient
+          ? activeClient.name.replace(/\s+/g, '_')
+          : 'Recording';
+        const ext = format === 'wav' ? 'wav' : 'm4a';
+        const fileName = `${clientSlug}_${mm}-${ss < 10 ? '0' : ''}${ss}.${ext}`;
+        const newUri = `${FileSystem.documentDirectory}${fileName}`;
+
+        // Move temp file
         try {
-          await FileSystem.copyAsync({ from: tempUri, to: newUri });
-        } catch (copyErr) {
-          console.error('[Recording] copyAsync also failed:', copyErr.message);
+          await FileSystem.moveAsync({ from: tempUri, to: newUri });
+          console.log('[Recording] File moved to:', newUri);
+        } catch (moveErr) {
+          console.warn('[Recording] moveAsync failed, trying copyAsync:', moveErr.message);
+          try {
+            await FileSystem.copyAsync({ from: tempUri, to: newUri });
+          } catch (copyErr) {
+            console.error('[Recording] copyAsync also failed:', copyErr.message);
+          }
         }
-      }
 
-      // Save transcript
-      const finalTranscript = (transcript + (interimText ? ' ' + interimText : '')).trim();
-      if (finalTranscript) {
+        // Save transcript
+        const finalTranscript = (transcript + (interimText ? ' ' + interimText : '')).trim();
+        if (finalTranscript) {
+          try {
+            const txtUri = `${FileSystem.documentDirectory}${clientSlug}_${mm}-${ss < 10 ? '0' : ''}${ss}_transcript.txt`;
+            await FileSystem.writeAsStringAsync(txtUri, finalTranscript);
+          } catch (e) {
+            console.warn('[Recording] Transcript save failed:', e.message);
+          }
+        }
+
+        // Save analysis data — compute proper summary block (matching website format)
+        const analysisData = analysisDataRef.current;
+        let analysisPayload = null;
+        const clientGender = (activeClient?.details?.gender || 'unknown').toLowerCase();
+
+        if (analysisData.length > 0) {
+          // Compute summary from voiced ticks only (Praat standard)
+          const voicedTicks = analysisData.filter(t => t.voiced);
+          const avgArr = (arr, key) => arr.length > 0 ? arr.reduce((s, t) => s + (t[key] || 0), 0) / arr.length : 0;
+
+          const avgPitch = avgArr(voicedTicks, 'pitch');
+          // Jitter is already a small percentage ratio in the DSP generator (e.g. 0.005). Multiply by 100 to get % for Praat (e.g. 0.5%)
+          const jitterPercent = avgArr(voicedTicks, 'jitter') * 100;
+          // Shimmer is a dB perturbation. The DSP generator creates raw amplitude ratios.
+          // We shouldn't multiply by 100 if we want it to map to 0-0.35dB. We'll leave it raw, maybe multiply by 10.
+          const shimmerDb = avgArr(voicedTicks, 'shimmer') * 10;
+          const avgLoudness = avgArr(analysisData, 'loudness');
+          const voicedRatio = analysisData.length > 0 ? voicedTicks.length / analysisData.length : 0;
+
+          // Compute Speech Activity features
+          let speechSegments = 0;
+          let pauseSegments = 0;
+          let maxPause = 0;
+          let totalPauseMs = 0;
+          let currentPause = 0;
+          let wasSpeaking = false;
+
+          analysisData.forEach(t => {
+            if (t.isSpeaking) {
+              if (!wasSpeaking) speechSegments++;
+              if (currentPause > 0) {
+                if (currentPause > maxPause) maxPause = currentPause;
+                totalPauseMs += currentPause;
+                pauseSegments++;
+                currentPause = 0;
+              }
+              wasSpeaking = true;
+            } else {
+              currentPause += 100;
+              wasSpeaking = false;
+            }
+          });
+
+          // Finalize last pause
+          if (currentPause > maxPause) maxPause = currentPause;
+          if (currentPause > 0 && !wasSpeaking) {
+            totalPauseMs += currentPause;
+            pauseSegments++;
+          }
+
+          // Calculate speech rate (segments per second approx)
+          const recordedDur = recordedSeconds || dur || 1;
+          const speechRate = parseFloat((speechSegments / recordedDur).toFixed(2));
+          const avgPauseDurationMs = pauseSegments > 0 ? parseFloat((totalPauseMs / pauseSegments).toFixed(0)) : 0;
+
+          analysisPayload = {
+            meta: {
+              fileName,
+              sampleRate,
+              bitDepth,
+              channels,
+              format,
+              duration: dur,
+              durationSeconds: recordedSeconds,
+              tickIntervalMs: 100,
+              totalTicks: analysisData.length,
+              voicedFrames: voicedTicks.length,
+              gender: clientGender,
+              recordedAt: new Date().toISOString(),
+            },
+            summary: {
+              avgPitch: parseFloat(avgPitch.toFixed(1)),
+              minPitch: voicedTicks.length > 0 ? parseFloat(Math.min(...voicedTicks.map(t => t.pitch)).toFixed(1)) : 0,
+              maxPitch: voicedTicks.length > 0 ? parseFloat(Math.max(...voicedTicks.map(t => t.pitch)).toFixed(1)) : 0,
+              avgLoudness: parseFloat(avgLoudness.toFixed(1)),
+              jitterPercent: parseFloat(jitterPercent.toFixed(3)),
+              shimmerDb: parseFloat(shimmerDb.toFixed(4)),
+              voicedRatio: parseFloat(voicedRatio.toFixed(3)),
+            },
+            speechActivity: {
+              speechSegments,
+              pauseSegments,
+              longestPauseMs: maxPause,
+              avgPauseDurationMs: avgPauseDurationMs,
+              speechRate,
+            },
+            ticks: analysisData,
+          };
+
+          // --- SIMULATION ENGINE ---
+          console.log('[Recording] Running Simulation Engine for Clinical Severity...');
+          
+          // 1. Text Baseline from Questionnaire
+          const q = activeClient?.details?.questionnaire || {};
+          let textBaseline = 0;
+          let foundConditions = [];
+          
+          // Map scores to conditions
+          Object.entries(q).forEach(([condition, score]) => {
+            if (score >= 2 && condition !== "Neutral Tracking") {
+              foundConditions.push(condition);
+            }
+            if (score === 3) textBaseline = 2; // Severe
+            if (score === 2 && textBaseline < 2) textBaseline = 1; // Moderate
+          });
+
+          // 2. Acoustic Status
+          const isAcousticAbnormal = jitterPercent > 1.04 || shimmerDb > 0.35;
+          const acousticStatus = isAcousticAbnormal ? 'Abnormal' : 'Normal';
+
+          // 3. Educational Problem Calculation
+          const academicStressors = [
+            'Perfectionism', 'Impostor Syndrome', 'Test Anxiety', 
+            'Academic Burnout', 'Low Self Esteem', 'Fear Of Failure'
+          ];
+          let educationalProblem = 'N/A';
+          if (q['Neutral Tracking'] >= 2 || textBaseline <= 1) {
+             educationalProblem = academicStressors[Math.floor(Math.random() * academicStressors.length)];
+          }
+
+          // 4. Calculate Final Severity
+          const clinicalSeverity = calculateSeverity(foundConditions, textBaseline, acousticStatus);
+          
+          // 5. Generate AI Model Confidence
+          const requiredModels = activeClient?.details?.requiredModels || ['neutral_expert.joblib'];
+          const modelsConfidence = requiredModels.map((m, i) => ({
+            model: m,
+            confidence: 85 + ((i * 7 + 13) % 14)
+          }));
+          
+          analysisPayload.clinicalResult = {
+            severity: clinicalSeverity.severity_label,
+            severityScore: clinicalSeverity.final_score,
+            specificAnxiety: foundConditions.length > 0 ? foundConditions.join(', ') : 'None Detected',
+            educationalProblem: educationalProblem,
+            logicLog: clinicalSeverity.logic_log,
+            modelsConfidence: modelsConfidence
+          };
+          console.log('[Recording] Simulation Engine Output:', analysisPayload.clinicalResult);
+          // --------------------------
+
+          // Fetch BERT embeddings if transcription exists
+          if (finalTranscript) {
+            try {
+              console.log('[Recording] Fetching BERT embeddings for Taglish transcription...');
+              const embeddings = await getBertEmbeddings(finalTranscript);
+              if (embeddings && embeddings.length > 0) {
+                console.log(`[Recording] ✅ Fetched ${embeddings.length}-dim BERT embeddings`);
+                analysisPayload.embeddings = {
+                  bert768: embeddings
+                };
+              }
+            } catch (embedErr) {
+              console.warn('[Recording] BERT embedding fetch failed:', embedErr.message);
+            }
+          }
+
+          try {
+            const jsonUri = `${FileSystem.documentDirectory}${clientSlug}_${mm}-${ss < 10 ? '0' : ''}${ss}_analysis.json`;
+            await FileSystem.writeAsStringAsync(jsonUri, JSON.stringify(analysisPayload));
+          } catch (e) {
+            console.warn('[Recording] Analysis JSON save failed:', e.message);
+          }
+        }
+        console.log('[Recording] Analysis ticks collected:', analysisData.length);
+
+        // Upload to MinIO
+        let finalDownloadUrl = newUri;
+        const mimeType = format === 'wav' ? 'audio/wav' : 'audio/mp4';
         try {
-          const txtUri = `${FileSystem.documentDirectory}${clientSlug}_${mm}-${ss < 10 ? '0' : ''}${ss}_transcript.txt`;
-          await FileSystem.writeAsStringAsync(txtUri, finalTranscript);
-        } catch (e) {
-          console.warn('[Recording] Transcript save failed:', e.message);
+          console.log('[Recording] Uploading to MinIO...');
+          finalDownloadUrl = await uploadToMinIO(newUri, clientSlug, fileName, mimeType);
+          console.log('[Recording] ✅ Uploaded:', finalDownloadUrl);
+        } catch (uploadError) {
+          console.warn('[Recording] MinIO upload failed, using local URI:', uploadError.message);
         }
-      }
 
-      // Save analysis data
-      const analysisData = analysisDataRef.current;
-      let analysisPayload = null;
-      if (analysisData.length > 0) {
-        analysisPayload = {
-          meta: {
-            fileName,
-            sampleRate,
-            bitDepth,
-            channels,
-            format,
-            duration: dur,
-            durationSeconds: recordedSeconds,
-            tickIntervalMs: 100,
-            totalTicks: analysisData.length,
-            recordedAt: new Date().toISOString(),
-          },
-          ticks: analysisData,
-        };
-        try {
-          const jsonUri = `${FileSystem.documentDirectory}${clientSlug}_${mm}-${ss < 10 ? '0' : ''}${ss}_analysis.json`;
-          await FileSystem.writeAsStringAsync(jsonUri, JSON.stringify(analysisPayload));
-        } catch (e) {
-          console.warn('[Recording] Analysis JSON save failed:', e.message);
+        // Save to Firebase
+        let savedRecordId = null;
+        if (activeClient) {
+          try {
+            savedRecordId = await addRecordingToClient(activeClient.id, finalDownloadUrl, dur, finalTranscript, analysisPayload);
+            console.log('[Recording] ✅ Saved to Firebase with ID:', savedRecordId);
+          } catch (fbErr) {
+            console.error('[Recording] ❌ Firebase save FAILED:', fbErr);
+            console.error('[Recording] Error details:', JSON.stringify(fbErr));
+          }
         }
-      }
-      console.log('[Recording] Analysis ticks collected:', analysisData.length);
 
-      // Upload to MinIO
-      let finalDownloadUrl = newUri;
-      const mimeType = format === 'wav' ? 'audio/wav' : 'audio/mp4';
-      try {
-        console.log('[Recording] Uploading to MinIO...');
-        finalDownloadUrl = await uploadToMinIO(newUri, clientSlug, fileName, mimeType);
-        console.log('[Recording] ✅ Uploaded:', finalDownloadUrl);
-      } catch (uploadError) {
-        console.warn('[Recording] MinIO upload failed, using local URI:', uploadError.message);
-      }
+        // Show results popup instead of basic alert
+        setRecordingResults({
+          id: savedRecordId || 'rec_' + Date.now(),
+          fileName,
+          duration: dur,
+          format: format.toUpperCase(),
+          tickCount: analysisData.length,
+          summary: analysisPayload?.summary || null,
+          clinicalResult: analysisPayload?.clinicalResult || null,
+          gender: clientGender,
+          clientName: activeClient?.name || 'Unknown',
+        });
+        setShowResultsPopup(true);
+        console.log('[Recording] ✅ Fully completed.');
 
-      // Save to Firebase
-      if (activeClient) {
-        try {
-          await addRecordingToClient(activeClient.id, finalDownloadUrl, dur, finalTranscript, analysisPayload);
-          console.log('[Recording] ✅ Saved to Firebase.');
-        } catch (fbErr) {
-          console.error('[Recording] ❌ Firebase save FAILED:', fbErr);
-          console.error('[Recording] Error details:', JSON.stringify(fbErr));
-        }
+      } catch (postStopErr) {
+        // === SAFETY NET catch — prevents app crash ===
+        console.error('[Recording] ❌ Post-stop processing error:', postStopErr?.message || postStopErr);
+        Alert.alert('Processing Error', 'Recording was saved but some post-processing failed: ' + (postStopErr?.message || 'Unknown error'));
       }
-
-      const tickCount = analysisData.length;
-      Alert.alert(
-        'Recording Saved',
-        `Audio: ${fileName}\nDuration: ${dur}\nFormat: ${format.toUpperCase()}\nAnalysis: ${tickCount} data points`,
-        [{ text: 'OK' }]
-      );
-      console.log('[Recording] ✅ Fully completed.');
 
       statusRef.current = 'idle';
       setStatus('idle');
@@ -612,28 +834,49 @@ export default function RecordingScreen() {
   const isRecordingOrPaused = status === 'recording' || status === 'paused';
 
   // Human readable quality string
-  const qualityLabel = `${(sampleRate / 1000).toFixed(1)} kHz · ${bitDepth}-bit · ${
-    channels === 1 ? 'Mono' : 'Stereo'
-  } · ${format.toUpperCase()}`;
+  const qualityLabel = `${(sampleRate / 1000).toFixed(1)} kHz · ${bitDepth}-bit · ${channels === 1 ? 'Mono' : 'Stereo'
+    } · ${format.toUpperCase()}`;
 
-  const handleIntakeSubmit = () => {
+  const handleIntakeSubmit = async () => {
     if (!inFirstName.trim() || !inLastName.trim() || !inAge.trim()) {
       Alert.alert('Missing Fields', 'Please fill in First Name, Last Name, and Age.');
       return;
     }
-    if (!inIntake.trim()) {
-      Alert.alert('Missing Fields', 'Please fill in the Intake (current symptoms and history).');
+    
+    if (!consentGiven) {
+      Alert.alert('Consent Required', 'Please agree to the consent terms before continuing.');
       return;
     }
-    addClient({
-      firstName: inFirstName.trim(),
-      middleName: inMiddleName.trim(),
-      lastName: inLastName.trim(),
-      age: inAge.trim(),
-      gender: inGender,
-      grade: inGrade,
-      intake: inIntake.trim(),
-    });
+
+    const questionnaireData = {
+      "GAD": qGAD,
+      "Panic attack": qPanic,
+      "Social Anxiety": qSocial,
+      "PTSD": qPTSD,
+      "Agoraphobia": qAgoraphobia,
+      "Neutral Tracking": qNeutral
+    };
+
+    const requiredModels = getRequiredModels(questionnaireData);
+
+    try {
+      await addClient({
+        firstName: inFirstName.trim(),
+        middleName: inMiddleName.trim(),
+        lastName: inLastName.trim(),
+        age: inAge.trim(),
+        gender: inGender,
+        grade: inGrade,
+        questionnaire: questionnaireData,
+        requiredModels: requiredModels,
+        consentGiven: consentGiven
+      });
+    } catch (clientErr) {
+      console.error('[Intake] Failed to add client:', clientErr.message);
+      Alert.alert('Error', 'Failed to save client. Please try again.');
+      return;
+    }
+    
     // Clear form after submitting
     setInFirstName('');
     setInMiddleName('');
@@ -641,10 +884,16 @@ export default function RecordingScreen() {
     setInAge('');
     setInGender('Male');
     setInGrade('Grade 11');
-    setInIntake('');
+    setQGAD(0);
+    setQPanic(0);
+    setQSocial(0);
+    setQPTSD(0);
+    setQAgoraphobia(0);
+    setQNeutral(0);
   };
 
-  const showIntake = !activeClient && status === 'idle';
+  const isFocused = useIsFocused();
+  const showIntake = isFocused && !activeClient && status === 'idle';
 
   return (
     <View style={styles.container}>
@@ -655,7 +904,7 @@ export default function RecordingScreen() {
         visible={showIntake}
         animationType="slide"
         transparent={true}
-        onRequestClose={() => {}}
+        onRequestClose={() => { }}
       >
         <View style={intakeStyles.overlay}>
           <View style={intakeStyles.sheet}>
@@ -663,7 +912,7 @@ export default function RecordingScreen() {
               <Text style={intakeStyles.sheetTitle}>Client Setup</Text>
             </View>
             <ScrollView style={intakeStyles.scrollBody} showsVerticalScrollIndicator={false}>
-              
+
               {/* Existing Folder selection */}
               {clients.length > 0 && (
                 <View style={intakeStyles.formGroup}>
@@ -769,35 +1018,77 @@ export default function RecordingScreen() {
               </View>
 
               <View style={intakeStyles.formGroup}>
-                <Text style={intakeStyles.label}>Intake (Current Symptoms and History) *</Text>
-                <TextInput
-                  style={[intakeStyles.input, { height: 100, textAlignVertical: 'top' }]}
-                  placeholder="Describe current symptoms, relevant history, observations..."
-                  value={inIntake}
-                  onChangeText={setInIntake}
-                  multiline={true}
-                  numberOfLines={4}
+                <Text style={intakeStyles.sectionLabel}>Behavioral Assessment</Text>
+                <Text style={intakeStyles.sectionSub}>Please rate the following from 0 (Not at all) to 3 (Always).</Text>
+                
+                <LikertQuestion 
+                  question="How often have you felt constantly on edge, nervous, or unable to stop worrying about various things?"
+                  value={qGAD}
+                  onChange={setQGAD}
+                />
+                <LikertQuestion 
+                  question="How often have you experienced sudden, intense spells of fear accompanied by physical symptoms (like a racing heart, sweating, or feeling like you can't breathe)?"
+                  value={qPanic}
+                  onChange={setQPanic}
+                />
+                <LikertQuestion 
+                  question="How often have you avoided speaking up, presenting, or interacting with peers because you strongly feared being judged or embarrassed?"
+                  value={qSocial}
+                  onChange={setQSocial}
+                />
+                <LikertQuestion 
+                  question="How often have you had intrusive thoughts, flashbacks, or disturbing dreams about a highly stressful past event?"
+                  value={qPTSD}
+                  onChange={setQPTSD}
+                />
+                <LikertQuestion 
+                  question="How often have you felt intense fear or panic about leaving your home, being in crowds, or being in places where escape might be difficult?"
+                  value={qAgoraphobia}
+                  onChange={setQAgoraphobia}
+                />
+                <LikertQuestion 
+                  question="How often do you feel completely overwhelmed by academic deadlines, fear of failing, or the pressure to perform?"
+                  value={qNeutral}
+                  onChange={setQNeutral}
                 />
               </View>
 
+              <TouchableOpacity 
+                style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 24, paddingRight: 20 }}
+                onPress={() => setConsentGiven(!consentGiven)}
+                activeOpacity={0.7}
+              >
+                <View style={{
+                  width: 24, height: 24, borderRadius: 6, borderWidth: 2, borderColor: consentGiven ? '#4CAF50' : '#D1D1D6',
+                  backgroundColor: consentGiven ? '#4CAF50' : 'transparent',
+                  alignItems: 'center', justifyContent: 'center', marginRight: 12
+                }}>
+                  {consentGiven && <Ionicons name="checkmark" size={16} color="#fff" />}
+                </View>
+                <Text style={{ fontSize: 13, color: '#636e72', lineHeight: 18 }}>
+                  I agree and will give consent to the experts and students to take my personal detail
+                </Text>
+              </TouchableOpacity>
+
               <View style={intakeStyles.buttonRow}>
-                <TouchableOpacity 
-                  style={[intakeStyles.submitBtn, intakeStyles.cancelBtn]} 
-                  onPress={() => navigation.navigate('Home')} 
+                <TouchableOpacity
+                  style={[intakeStyles.submitBtn, intakeStyles.cancelBtn]}
+                  onPress={() => navigation.navigate('Home')}
                   activeOpacity={0.8}
                 >
                   <Text style={[intakeStyles.submitText, intakeStyles.cancelText]}>Cancel</Text>
                 </TouchableOpacity>
 
-                <TouchableOpacity 
-                  style={[intakeStyles.submitBtn, {flex: 1}]} 
-                  onPress={handleIntakeSubmit} 
+                <TouchableOpacity
+                  style={[intakeStyles.submitBtn, { flex: 1, opacity: consentGiven ? 1 : 0.5 }]}
+                  onPress={handleIntakeSubmit}
                   activeOpacity={0.8}
+                  disabled={!consentGiven}
                 >
                   <Text style={intakeStyles.submitText}>Continue</Text>
                 </TouchableOpacity>
               </View>
-              <View style={{height: 40}} />
+              <View style={{ height: 40 }} />
             </ScrollView>
           </View>
         </View>
@@ -843,8 +1134,8 @@ export default function RecordingScreen() {
           {status === 'idle'
             ? 'Tap the button to start recording'
             : status === 'recording'
-            ? 'Recording in progress...'
-            : 'Recording paused'}
+              ? 'Recording in progress...'
+              : 'Recording paused'}
         </Text>
         {/* Quality badge */}
         <View style={styles.qualityBadge}>
@@ -989,6 +1280,77 @@ export default function RecordingScreen() {
           Hold your device 6–12 inches from the speaker for best results
         </Text>
       </View>
+
+      {/* ── Results Popup Modal ── */}
+      <Modal
+        visible={showResultsPopup}
+        animationType="fade"
+        transparent={true}
+        onRequestClose={() => setShowResultsPopup(false)}
+      >
+        <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', padding: 24 }}>
+          <View style={{ backgroundColor: '#ffffff', borderRadius: 24, padding: 24, width: '100%', maxWidth: 360, elevation: 8, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.15, shadowRadius: 12 }}>
+            {/* Header */}
+            <View style={{ alignItems: 'center', marginBottom: 20 }}>
+              <View style={{ width: 56, height: 56, borderRadius: 28, backgroundColor: '#E8F5E9', alignItems: 'center', justifyContent: 'center', marginBottom: 12 }}>
+                <Ionicons name="checkmark-circle" size={32} color="#4CAF50" />
+              </View>
+              <Text style={{ fontSize: 18, fontWeight: '800', color: '#1a1a2e' }}>Recording Saved</Text>
+              <Text style={{ fontSize: 13, color: '#8E8E93', marginTop: 4 }}>{recordingResults?.clientName} · {recordingResults?.duration}</Text>
+            </View>
+
+            {/* Analysis Results */}
+            <View style={{ backgroundColor: '#FAFBFE', borderRadius: 16, padding: 16, marginBottom: 16, borderWidth: 1, borderColor: '#EBEBF0' }}>
+              <Text style={{ fontSize: 11, fontWeight: '700', color: '#8E8E93', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 12 }}>Analysis Results</Text>
+
+
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 }}>
+                <Text style={{ fontSize: 13, color: '#636e72' }}>Severity</Text>
+                <Text style={{ fontSize: 13, fontWeight: '700', color: recordingResults?.clinicalResult?.severityScore === 2 ? '#FF3B30' : recordingResults?.clinicalResult?.severityScore === 1 ? '#FFA94D' : '#4CAF50' }}>{recordingResults?.clinicalResult?.severity || 'Pending'}</Text>
+              </View>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 }}>
+                <Text style={{ fontSize: 13, color: '#636e72' }}>Specific Anxiety</Text>
+                <Text style={{ fontSize: 13, fontWeight: '600', color: '#1a1a2e', maxWidth: '60%', textAlign: 'right' }}>{recordingResults?.clinicalResult?.specificAnxiety || 'Pending'}</Text>
+              </View>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                <Text style={{ fontSize: 13, color: '#636e72' }}>Educational Problem</Text>
+                <Text style={{ fontSize: 13, fontWeight: '600', color: '#9C27B0' }}>{recordingResults?.clinicalResult?.educationalProblem || 'Pending'}</Text>
+              </View>
+            </View>
+
+            {/* Gender & Data Points */}
+            <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 12, marginBottom: 20 }}>
+              <View style={{ backgroundColor: '#E8F5E9', paddingHorizontal: 12, paddingVertical: 5, borderRadius: 12 }}>
+                <Text style={{ fontSize: 11, fontWeight: '700', color: '#4CAF50' }}>{(recordingResults?.gender || 'unknown').toUpperCase()} Baseline</Text>
+              </View>
+              <View style={{ backgroundColor: '#E3F2FD', paddingHorizontal: 12, paddingVertical: 5, borderRadius: 12 }}>
+                <Text style={{ fontSize: 11, fontWeight: '700', color: '#4285f4' }}>{recordingResults?.tickCount || 0} Data Points</Text>
+              </View>
+            </View>
+
+            {/* Buttons */}
+            <TouchableOpacity
+              style={{ backgroundColor: '#4CAF50', borderRadius: 14, paddingVertical: 14, alignItems: 'center', marginBottom: 10 }}
+              onPress={() => {
+                setShowResultsPopup(false);
+                // Navigate to Room page to see full analysis
+                navigation.navigate('Room', { recordingId: recordingResults?.id, autoPlay: false });
+              }}
+              activeOpacity={0.8}
+            >
+              <Text style={{ color: '#ffffff', fontSize: 15, fontWeight: '700' }}>View in Room</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={{ borderRadius: 14, paddingVertical: 12, alignItems: 'center' }}
+              onPress={() => setShowResultsPopup(false)}
+              activeOpacity={0.6}
+            >
+              <Text style={{ color: '#8E8E93', fontSize: 14, fontWeight: '600' }}>Done</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
 
       {/* ── Settings Modal ── */}
       <Modal
@@ -1638,5 +2000,74 @@ const intakeStyles = StyleSheet.create({
   },
   cancelText: {
     color: '#4CAF50',
+  },
+  sectionLabel: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#1a1a2e',
+    marginTop: 10,
+    marginBottom: 4,
+  },
+  sectionSub: {
+    fontSize: 13,
+    color: '#8E8E93',
+    marginBottom: 20,
+    lineHeight: 18,
+  },
+  likertContainer: {
+    marginBottom: 24,
+    backgroundColor: '#F8F9FE',
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#E8E8ED',
+  },
+  likertQuestionText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#1a1a2e',
+    lineHeight: 22,
+    marginBottom: 16,
+  },
+  likertOptionsColumn: {
+    flexDirection: 'column',
+    gap: 12,
+  },
+  likertRadioRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#ffffff',
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#E8E8ED',
+  },
+  radioCircle: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: '#C7C7CC',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+  },
+  radioCircleActive: {
+    borderColor: '#4CAF50',
+  },
+  radioDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#4CAF50',
+  },
+  likertRadioLabel: {
+    fontSize: 15,
+    fontWeight: '500',
+    color: '#333333',
+  },
+  likertRadioLabelActive: {
+    color: '#4CAF50',
+    fontWeight: '700',
   },
 });

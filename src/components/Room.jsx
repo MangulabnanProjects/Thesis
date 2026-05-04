@@ -355,7 +355,7 @@ function Room({ recording, onSeeAnalytics }) {
             </div>
             <div className="room__result-info">
               <span className="room__result-label">Severity</span>
-              <span className={`room__result-value room__result-value--${rec.severity === 'Significant' ? 'red' : rec.severity === 'Moderate' ? 'orange' : 'green'}`}>{rec.severity}</span>
+              <span className={`room__result-value room__result-value--${recording?.analysisData?.clinicalResult?.severityScore === 2 ? 'red' : recording?.analysisData?.clinicalResult?.severityScore === 1 ? 'orange' : 'green'}`}>{recording?.analysisData?.clinicalResult?.severity || 'Pending'}</span>
             </div>
           </div>
 
@@ -370,8 +370,8 @@ function Room({ recording, onSeeAnalytics }) {
               </svg>
             </div>
             <div className="room__result-info">
-              <span className="room__result-label">Detected Emotion</span>
-              <span className="room__result-value room__result-value--blue">{rec.emotion}</span>
+              <span className="room__result-label">Educational Problem</span>
+              <span className="room__result-value room__result-value--blue">{recording?.analysisData?.clinicalResult?.educationalProblem || 'Pending'}</span>
             </div>
           </div>
 
@@ -384,7 +384,7 @@ function Room({ recording, onSeeAnalytics }) {
             </div>
             <div className="room__result-info">
               <span className="room__result-label">Specific Anxiety</span>
-              <span className="room__result-value room__result-value--purple">{rec.anxiety}</span>
+              <span className="room__result-value room__result-value--purple">{recording?.analysisData?.clinicalResult?.specificAnxiety || 'Pending'}</span>
             </div>
           </div>
         </div>
@@ -399,15 +399,26 @@ function Room({ recording, onSeeAnalytics }) {
           </svg>
           AI Model Confidence
         </h3>
-        <div className="room__confidence">
-          <div className="room__confidence-track">
-            <div className="room__confidence-fill" style={{ width: `${rec.confidence}%` }} />
-          </div>
-          <div className="room__confidence-info">
-            <span className="room__confidence-percent">{rec.confidence}%</span>
-            <span className="room__confidence-label">Prediction Accuracy</span>
-          </div>
-        </div>
+        
+        {(() => {
+          const confidences = recording?.analysisData?.clinicalResult?.modelsConfidence || [];
+          if (confidences.length === 0) return <div className="room__confidence-info"><span className="room__confidence-label">No AI Confidence Data Available</span></div>;
+          
+          return confidences.map((item, i) => {
+            const readableName = item.model.replace('_expert.joblib', '').replace(/_/g, ' ').toUpperCase();
+            return (
+              <div key={item.model} className="room__confidence" style={{ marginBottom: i < confidences.length - 1 ? '16px' : '0' }}>
+                <div className="room__confidence-track">
+                  <div className="room__confidence-fill" style={{ width: `${item.confidence}%` }} />
+                </div>
+                <div className="room__confidence-info">
+                  <span className="room__confidence-percent">{item.confidence}%</span>
+                  <span className="room__confidence-label">{readableName}</span>
+                </div>
+              </div>
+            );
+          });
+        })()}
       </div>
     </div>
   );

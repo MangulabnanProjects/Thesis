@@ -29,7 +29,9 @@ export const addClientToDB = async (client) => {
       age: client.details.age,
       gender: client.details.gender,
       grade: client.details.grade,
-      intake: client.details.intake || '',
+      questionnaire: client.details.questionnaire || null,
+      requiredModels: client.details.requiredModels || [],
+      consentGiven: client.details.consentGiven || false,
       color: client.color,
       archivedAt: client.archivedAt || null,
     });
@@ -76,7 +78,9 @@ export const getClientsFromDB = async () => {
           lastName: row.lastName,
           age: parseInt(row.age, 10) || 0,
           gender: row.gender,
-          grade: row.grade,
+          questionnaire: row.questionnaire || null,
+          requiredModels: row.requiredModels || [],
+          consentGiven: row.consentGiven || false,
         },
         recordings: recordingsByClient[row.id] || [],
       });

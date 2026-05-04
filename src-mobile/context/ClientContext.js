@@ -47,7 +47,7 @@ export function ClientProvider({ children }) {
             duration: rec.duration,
             date: rec.date,
             transcription: rec.transcription,
-            analysisData: rec.analysisData ? JSON.parse(rec.analysisData) : null,
+            analysisData: rec.analysisData ? (() => { try { return JSON.parse(rec.analysisData); } catch { return null; } })() : null,
             archivedAt: rec.archivedAt,
           });
         });
@@ -67,7 +67,10 @@ export function ClientProvider({ children }) {
               age: parseInt(row.age, 10) || 0,
               gender: row.gender,
               grade: row.grade,
-              intake: row.intake || '',
+              focusAreas: row.focusAreas || [],
+              questionnaire: row.questionnaire || null,
+              requiredModels: row.requiredModels || [],
+              consentGiven: row.consentGiven || false,
             },
             recordings: recordingsByClient[row.id] || [],
           });
@@ -118,6 +121,7 @@ export function ClientProvider({ children }) {
     };
 
     await addRecordingToDB(newRecord);
+    return newRecord.id;
   };
 
   // ── Archive (soft delete — synced to Firebase) ──

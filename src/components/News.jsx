@@ -1,44 +1,55 @@
 import './News.css';
 
 const severityLevels = [
-  { name: 'Mild', color: '#4caf50', icon: '🟢', description: 'Occasional worry or nervousness that does not significantly interfere with daily activities. Individuals may experience slight unease in certain situations but can manage and recover quickly.' },
-  { name: 'Moderate', color: '#ff9800', icon: '🟡', description: 'Persistent anxiety that begins to affect daily functioning, including work performance, social interactions, and sleep quality. Physical symptoms like increased heart rate or muscle tension may be noticeable.' },
-  { name: 'Significant', color: '#f44336', icon: '🟠', description: 'Intense and frequent anxiety that substantially disrupts everyday life. Activities that were once manageable become difficult, and avoidance behaviors may develop. Professional support is strongly recommended.' },
-  { name: 'Panic', color: '#b71c1c', icon: '🔴', description: 'Severe, overwhelming episodes of intense fear or dread that may include difficulty breathing, chest pain, dizziness, and a sense of losing control. Immediate professional intervention is critical.' },
+  { name: 'Normal', color: '#4caf50', icon: '🟢', description: 'A stable emotional and mental state with baseline stress levels that do not interfere with daily functioning, focus, or well-being.' },
+  { name: 'Moderate', color: '#ff9800', icon: '🟡', description: 'Noticeable psychological or physical stress symptoms that begin to affect daily functioning, causing occasional disruptions in focus, sleep, or mood.' },
+  { name: 'Severe', color: '#f44336', icon: '🔴', description: 'Intense and persistent symptoms that significantly impair daily life, cognitive function, and emotional stability. Professional support is strongly recommended.' },
 ];
 
-const emotions = [
-  { name: 'Anxious / Tense', icon: '😰', description: 'Characterized by persistent worry, restlessness, and a heightened state of alertness. Voice patterns typically show increased pitch variability and faster speech rate.' },
-  { name: 'Stressed', icon: '😫', description: 'A state of mental or emotional strain from adverse circumstances. Vocal markers include breathiness, vocal fatigue, and irregular pauses during speech.' },
-  { name: 'Calm / Neutral', icon: '😌', description: 'A relaxed and balanced emotional state. Speech patterns are steady with consistent pitch, rhythm, and clear articulation throughout.' },
-  { name: 'Fearful', icon: '😨', description: 'An intense emotional response to perceived danger or threat. The voice may tremble, pitch rises sharply, and breathing becomes shallow and rapid.' },
-  { name: 'Sad / Fatigued', icon: '😢', description: 'A low-energy state marked by feelings of sadness, fatigue, or hopelessness. Voice tends to be monotone with lower pitch, slower speech rate, and longer pauses.' },
-  { name: 'Frustrated / Irritable', icon: '😤', description: 'Elevated agitation and reduced patience. Vocal indicators include increased volume, sharper tone, and abrupt speech patterns with shorter sentences.' },
+const psychologicalProblems = [
+  { name: 'Social Anxiety', icon: '👥', description: 'Intense, persistent fear of being watched and judged by others, often leading to avoidance of social or performance situations.' },
+  { name: 'PTSD', icon: '🧠', description: 'A mental health condition triggered by experiencing or witnessing a terrifying event, characterized by flashbacks, nightmares, and severe anxiety.' },
+  { name: 'Panic Attack', icon: '⚡', description: 'Sudden episodes of intense fear or discomfort that peak within minutes, often accompanied by physical symptoms like heart palpitations and shortness of breath.' },
+  { name: 'GAD', icon: '🌀', description: 'Generalized Anxiety Disorder involves excessive, uncontrollable worry about everyday issues—such as health, finances, or academic performance.' },
+  { name: 'Agoraphobia', icon: '🏠', description: 'Fear of being in places or situations where escape might be difficult, or where help may not be available in the event of panic symptoms.' },
 ];
 
-const anxietyTypes = [
-  { name: 'Social Anxiety', icon: '👥', description: 'Intense fear of being judged, negatively evaluated, or rejected in social situations. Individuals may avoid public speaking, meeting new people, or eating in front of others.' },
-  { name: 'Generalized Anxiety', icon: '🌀', description: 'Excessive, uncontrollable worry about various aspects of daily life including health, finances, work, and relationships, often without a specific trigger.' },
-  { name: 'Performance Anxiety', icon: '🎤', description: 'Fear related to performing tasks in front of others, such as presentations, exams, or artistic performances. It can cause vocal tremors and cognitive blanking.' },
-  { name: 'Health Anxiety', icon: '🏥', description: 'Excessive worry about having or developing a serious medical condition. Normal bodily sensations are often misinterpreted as signs of illness.' },
-  { name: 'Panic Disorder', icon: '⚡', description: 'Recurrent, unexpected panic attacks — sudden surges of intense fear that peak within minutes, accompanied by physical symptoms like pounding heart and shortness of breath.' },
+const educationalProblems = [
+  { name: 'Perfectionism', icon: '🎯', description: 'Setting unrealistically high expectations for oneself, leading to harsh self-criticism, fear of making mistakes, and immense pressure.' },
+  { name: 'Impostor Syndrome', icon: '🎭', description: 'A psychological pattern where individuals doubt their skills or accomplishments and have a persistent internalized fear of being exposed as a fraud.' },
+  { name: 'Test Anxiety', icon: '📝', description: 'A combination of physical symptoms and emotional reactions that occur before or during exams, significantly hindering academic performance.' },
+  { name: 'Academic Burnout', icon: '🔥', description: 'A state of chronic exhaustion, cynicism, and reduced professional efficacy caused by prolonged academic stress and excessive workload.' },
+  { name: 'Low Self Esteem', icon: '📉', description: 'A subjective evaluation of ones own worth characterized by a lack of confidence and feeling consistently inadequate compared to peers.' },
+  { name: 'Lack Of Academic Support', icon: '🚫', description: 'The absence of necessary guidance, resources, or emotional backing from educators, peers, or family to succeed academically.' },
+  { name: 'Fear Of Failure', icon: '🛑', description: 'An irrational and persistent fear of failing that paralyzes decision-making and prevents individuals from attempting new academic challenges.' },
+  { name: 'Poor Time Management', icon: '⏳', description: 'Difficulty in planning and exercising conscious control of time spent on specific activities, often resulting in procrastination and chronic stress.' },
+  { name: 'Pressure Of Surroundings', icon: '🌪️', description: 'The intense stress generated by expectations from family, peers, or society to achieve specific academic or career milestones.' },
+  { name: 'Performance Anxiety', icon: '🎤', description: 'Fear about ones ability to perform a specific task, such as a presentation or recital, leading to worry that directly degrades performance quality.' },
+  { name: 'Specific Phobia', icon: '🕷️', description: 'An intense, irrational fear of a specific trigger (such as public speaking or a particular academic subject) that poses little or no actual danger.' },
+];
+
+const keyTerms = [
+  { name: 'Acoustic Vitals (Biomarkers)', icon: '🗣️', description: 'Measurable vocal characteristics, such as Pitch, Jitter, and Shimmer, that act as physiological lie detectors revealing physical stress.' },
+  { name: 'Likert Scale Intake', icon: '📋', description: 'A psychometric assessment used during client setup to quantify the frequency of specific anxiety or trauma symptoms (0-3 scale).' },
+  { name: 'Severity Router', icon: '🔀', description: 'An intelligent filtration system that determines which specific AI models to load based on clinical urgency and client history.' },
+  { name: 'Baseline Severity', icon: '📈', description: 'The initial psychological risk level calculated purely from textual symptom tracking before acoustic parameters are applied.' },
 ];
 
 function News() {
   return (
     <div className="news">
       <div className="news__hero">
-        <h1 className="news__hero-title">Understanding Voice-Based <span className="news__accent">Anxiety Analysis</span></h1>
-        <p className="news__hero-subtitle">Clinical Voice uses advanced AI to detect emotional patterns and anxiety indicators through vocal biomarkers. Learn about the different classifications our system identifies.</p>
+        <h1 className="news__hero-title">Understanding Clinical <span className="news__accent">Assessments</span></h1>
+        <p className="news__hero-subtitle">Our platform tracks specific severity levels, psychological conditions, and educational stressors to build a comprehensive acoustic baseline.</p>
       </div>
 
       {/* Severity Levels */}
       <section className="news__section">
         <h2 className="news__section-title">
           <span className="news__section-icon">📊</span>
-          Severity Levels
+          Severity Classification
         </h2>
-        <p className="news__section-desc">Our system classifies anxiety severity into four distinct levels based on vocal pattern intensity and consistency.</p>
+        <p className="news__section-desc">Our system classifies psychological stress severity into three distinct levels based on text and acoustic biomarkers.</p>
         <div className="news__grid">
           {severityLevels.map(item => (
             <div className="news__card" key={item.name} style={{ borderTopColor: item.color }}>
@@ -52,35 +63,55 @@ function News() {
         </div>
       </section>
 
-      {/* Emotions */}
+      {/* Psychological Problems */}
       <section className="news__section">
         <h2 className="news__section-title">
-          <span className="news__section-icon">🎭</span>
-          Detected Emotions
+          <span className="news__section-icon">🧠</span>
+          Psychological Problems
         </h2>
-        <p className="news__section-desc">Voice analysis can detect subtle emotional states through changes in pitch, tempo, jitter, shimmer, and MFCCs.</p>
-        <div className="news__grid news__grid--3col">
-          {emotions.map(item => (
-            <div className="news__card" key={item.name}>
-              <div className="news__card-header">
-                <span className="news__card-icon">{item.icon}</span>
+        <p className="news__section-desc">We detect patterns indicative of the following core clinical anxiety disorders and traumatic stress indicators.</p>
+        <div className="news__grid news__grid--list">
+          {psychologicalProblems.map(item => (
+            <div className="news__card news__card--horizontal" key={item.name}>
+              <span className="news__card-icon news__card-icon--large">{item.icon}</span>
+              <div className="news__card-body">
                 <h3 className="news__card-name">{item.name}</h3>
+                <p className="news__card-desc">{item.description}</p>
               </div>
-              <p className="news__card-desc">{item.description}</p>
             </div>
           ))}
         </div>
       </section>
 
-      {/* Anxiety Types */}
+      {/* Educational Problems */}
       <section className="news__section">
         <h2 className="news__section-title">
-          <span className="news__section-icon">🧠</span>
-          Anxiety Types
+          <span className="news__section-icon">📚</span>
+          Educational Problems
         </h2>
-        <p className="news__section-desc">Different forms of anxiety present unique vocal signatures that our model is trained to identify and classify.</p>
+        <p className="news__section-desc">Academic environments introduce unique stressors. Our neutral baseline tracking looks for signs of these educational challenges.</p>
         <div className="news__grid news__grid--list">
-          {anxietyTypes.map(item => (
+          {educationalProblems.map(item => (
+            <div className="news__card news__card--horizontal" key={item.name}>
+              <span className="news__card-icon news__card-icon--large">{item.icon}</span>
+              <div className="news__card-body">
+                <h3 className="news__card-name">{item.name}</h3>
+                <p className="news__card-desc">{item.description}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* Key Terms */}
+      <section className="news__section">
+        <h2 className="news__section-title">
+          <span className="news__section-icon">📖</span>
+          System Key Terms
+        </h2>
+        <p className="news__section-desc">Familiarize yourself with the core clinical terminologies underlying our voice analysis engine.</p>
+        <div className="news__grid news__grid--list">
+          {keyTerms.map(item => (
             <div className="news__card news__card--horizontal" key={item.name}>
               <span className="news__card-icon news__card-icon--large">{item.icon}</span>
               <div className="news__card-body">

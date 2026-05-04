@@ -2,19 +2,14 @@ import { useState, useEffect, useMemo } from 'react';
 import './Dashboard.css';
 import { collection, onSnapshot } from 'firebase/firestore';
 import { db } from '../firebaseConfig';
-import { analyzeAudio, CLINICAL_THRESHOLDS } from '../utils/audioAnalysis';
-import { getStreamUrl } from '../config/minioConfig';
+import { CLINICAL_THRESHOLDS } from '../utils/audioAnalysis';
 
-// ── Dashboard: Real DSP-based Audio Analysis ─────────────────
-// All visualizations are computed from the actual audio waveform
-// using autocorrelation pitch detection, jitter, and shimmer.
+// ── Dashboard: reads saved analysis from Firestore ───────────
+// Analysis is computed once at recording time on mobile.
+// No re-analysis needed — just fetch and display.
 
 function Dashboard({ recording }) {
   const [totalRecordings, setTotalRecordings] = useState(0);
-  const [analysis, setAnalysis] = useState(null);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [analysisError, setAnalysisError] = useState(null);
-  const [overrideGender, setOverrideGender] = useState(recording?.gender || 'unknown');
 
   // Listen for total recordings count — only count those with a valid client
   useEffect(() => {
@@ -41,42 +36,14 @@ function Dashboard({ recording }) {
     return () => unsubClients();
   }, []);
 
-  // Sync override gender when recording changes
-  useEffect(() => {
-    if (recording) setOverrideGender(recording.gender || 'unknown');
-  }, [recording]);
-
-  // Run real DSP analysis when a recording or gender override is selected
-  useEffect(() => {
-    if (!recording?.uri) {
-      setAnalysis(null);
-      return;
+  // Parse analysis from Firestore
+  const analysis = useMemo(() => {
+    if (!recording?.analysisData) return null;
+    if (typeof recording.analysisData === 'string') {
+      try { return JSON.parse(recording.analysisData); } catch { return null; }
     }
-
-    let cancelled = false;
-    setIsAnalyzing(true);
-    setAnalysisError(null);
-    setAnalysis(null);
-
-    const streamUrl = getStreamUrl(recording.uri);
-
-    analyzeAudio(streamUrl, overrideGender)
-      .then((result) => {
-        if (!cancelled) {
-          setAnalysis(result);
-          setIsAnalyzing(false);
-        }
-      })
-      .catch((err) => {
-        console.error('[Dashboard] Analysis failed:', err);
-        if (!cancelled) {
-          setAnalysisError(err.message);
-          setIsAnalyzing(false);
-        }
-      });
-
-    return () => { cancelled = true; };
-  }, [recording?.id, recording?.uri, overrideGender]);
+    return recording.analysisData;
+  }, [recording?.analysisData]);
 
 
   // If no recording is selected, show empty default state
@@ -93,7 +60,7 @@ function Dashboard({ recording }) {
           <div className="dashboard__stat-card">
             <div className="dashboard__stat-header">
               <div className="dashboard__stat-icon dashboard__stat-icon--green">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <polygon points="5 3 19 12 5 21 5 3" />
                 </svg>
               </div>
@@ -117,75 +84,84 @@ function Dashboard({ recording }) {
     );
   }
 
-  // ── Loading/Error states ───────────────────────────────────
+  // ── Loading state (only if Firestore fetch is slow) ────────
   const personName = recording.personName || 'Unknown';
 
-  if (isAnalyzing) {
+  if (!analysis) {
     return (
       <div className="dashboard">
         <div className="dashboard__welcome">
-          <h2 className="dashboard__greeting">Analyzing Audio...</h2>
+          <h2 className="dashboard__greeting">Loading Analysis...</h2>
           <p className="dashboard__subtitle">
-            Running DSP analysis on <strong>{personName}</strong>'s recording using autocorrelation pitch detection.
+            Fetching saved analysis data for <strong>{personName}</strong>'s recording.
           </p>
         </div>
         <div className="dashboard__empty-state">
           <div className="dashboard__analyzing-spinner" />
-          <h3 className="dashboard__empty-title">Processing Audio Signal</h3>
-          <p className="dashboard__empty-desc">Decoding audio → Detecting pitch (F0) → Computing jitter & shimmer...</p>
+          <h3 className="dashboard__empty-title">Retrieving Data</h3>
+          <p className="dashboard__empty-desc">Analysis data is stored in Firestore and should load momentarily.</p>
         </div>
       </div>
     );
   }
 
-  if (analysisError || !analysis) {
-    return (
-      <div className="dashboard">
-        <div className="dashboard__welcome">
-          <h2 className="dashboard__greeting">Analysis Failed</h2>
-          <p className="dashboard__subtitle">{analysisError || 'No analysis data available.'}</p>
-        </div>
-      </div>
-    );
-  }
+  // ── Saved analysis data from Firestore ─────────────────────
+  const ticks = analysis.ticks || [];
+  const meta = analysis.meta || {};
+  
+  // Build summary from ticks if not present (for old recordings)
+  const summary = analysis.summary || (() => {
+    if (ticks.length === 0) return { avgPitch: 0, minPitch: 0, maxPitch: 0, avgLoudness: 0, jitterPercent: 0, shimmerDb: 0, voicedRatio: 0 };
+    const voiced = ticks.filter(t => t.voiced || t.pitch > 0);
+    const avg = (arr, key) => arr.length > 0 ? arr.reduce((s, t) => s + (t[key] || 0), 0) / arr.length : 0;
+    return {
+      avgPitch: parseFloat(avg(voiced, 'pitch').toFixed(1)),
+      minPitch: voiced.length > 0 ? parseFloat(Math.min(...voiced.map(t => t.pitch)).toFixed(1)) : 0,
+      maxPitch: voiced.length > 0 ? parseFloat(Math.max(...voiced.map(t => t.pitch)).toFixed(1)) : 0,
+      avgLoudness: parseFloat(avg(ticks, 'loudness').toFixed(1)),
+      jitterPercent: parseFloat((avg(voiced, 'jitter') * 100).toFixed(3)),
+      shimmerDb: parseFloat((avg(voiced, 'shimmer') * 100).toFixed(4)),
+      voicedRatio: ticks.length > 0 ? parseFloat((voiced.length / ticks.length).toFixed(3)) : 0,
+    };
+  })();
 
-  // ── Real analysis data ─────────────────────────────────────
-  const { ticks, summary, meta } = analysis;
-  const voicedTicks = ticks.filter(t => t.voiced);
+  const voicedTicks = ticks.filter(t => t.voiced || t.pitch > 0);
 
-  // Build SVG paths from REAL analyzed data
-  const waveformPath = buildPath(ticks, t => t.amp, 800, 120, 0, 1);
-  const pitchPath = buildPath(voicedTicks, t => t.pitch, 800, 80, summary.minPitch, summary.maxPitch);
-  const jitterPath = buildPath(ticks, t => t.jitter, 800, 60, 0, Math.max(0.05, ...ticks.map(t => t.jitter)));
-  const shimmerPath = buildPath(ticks, t => t.shimmer, 800, 60, 0, Math.max(0.001, ...ticks.map(t => t.shimmer)));
+  // Build SVG paths from saved data (guard against empty arrays)
+  const waveformPath = ticks.length > 0 ? buildPath(ticks, t => t.amp, 800, 120, 0, 1) : '';
+  const pitchPath = voicedTicks.length > 0 ? buildPath(voicedTicks, t => t.pitch, 800, 80, summary.minPitch || 0, summary.maxPitch || 300) : '';
+  const jitterMax = ticks.length > 0 ? Math.max(0.05, ...ticks.map(t => t.jitter || 0)) : 0.05;
+  const jitterPath = ticks.length > 0 ? buildPath(ticks, t => t.jitter || 0, 800, 60, 0, jitterMax) : '';
+  const shimmerMax = ticks.length > 0 ? Math.max(0.001, ...ticks.map(t => t.shimmer || 0)) : 0.001;
+  const shimmerPath = ticks.length > 0 ? buildPath(ticks, t => t.shimmer || 0, 800, 60, 0, shimmerMax) : '';
 
   // Time axis labels
-  const timeLabels = getTimeLabels(ticks, 5);
+  const timeLabels = ticks.length > 0 ? getTimeLabels(ticks, 5) : [];
 
-  // Gender specific thresholds
-  const genderKey = meta.gender || 'unknown';
-  const thresholds = CLINICAL_THRESHOLDS[genderKey];
+  // Gender from recording metadata (fixed at recording time, not editable)
+  const genderKey = meta?.gender || recording?.gender?.toLowerCase() || 'unknown';
+  const thresholds = CLINICAL_THRESHOLDS[genderKey] || CLINICAL_THRESHOLDS.unknown;
 
   // Severity based on clinical thresholds
   // Score = (Jitter Weight × 40%) + (Shimmer Weight × 35%) + (Pitch Weight × 25%)
   
   // Jitter Weight
   let jWeight = 0;
-  if (summary.jitterPercent > thresholds.jitter.normalHigh) jWeight = 33;
-  if (summary.jitterPercent > thresholds.jitter.normalHigh * 1.5) jWeight = 66;
-  if (summary.jitterPercent > thresholds.jitter.normalHigh * 2.5) jWeight = 100;
+  if ((summary?.jitterPercent || 0) > thresholds.jitter.normalHigh) jWeight = 33;
+  if ((summary?.jitterPercent || 0) > thresholds.jitter.normalHigh * 1.5) jWeight = 66;
+  if ((summary?.jitterPercent || 0) > thresholds.jitter.normalHigh * 2.5) jWeight = 100;
 
   // Shimmer Weight
   let sWeight = 0;
-  if (summary.shimmerDb > thresholds.shimmer.normalHigh) sWeight = 33;
-  if (summary.shimmerDb > thresholds.shimmer.normalHigh * 1.5) sWeight = 66;
-  if (summary.shimmerDb > thresholds.shimmer.normalHigh * 2.5) sWeight = 100;
+  if ((summary?.shimmerDb || 0) > thresholds.shimmer.normalHigh) sWeight = 33;
+  if ((summary?.shimmerDb || 0) > thresholds.shimmer.normalHigh * 1.5) sWeight = 66;
+  if ((summary?.shimmerDb || 0) > thresholds.shimmer.normalHigh * 2.5) sWeight = 100;
 
   // Pitch Weight
   let pWeight = 0;
-  if (summary.avgPitch > thresholds.pitch.normalHigh || summary.avgPitch < thresholds.pitch.normalLow) pWeight = 33;
-  if (summary.avgPitch > thresholds.pitch.normalHigh * 1.2 || summary.avgPitch < thresholds.pitch.normalLow * 0.8) pWeight = 66;
-  if (summary.avgPitch > thresholds.pitch.normalHigh * 1.5 || summary.avgPitch < thresholds.pitch.normalLow * 0.6) pWeight = 100;
+  if ((summary?.avgPitch || 0) > thresholds.pitch.normalHigh || (summary?.avgPitch || 0) < thresholds.pitch.normalLow) pWeight = 33;
+  if ((summary?.avgPitch || 0) > thresholds.pitch.normalHigh * 1.2 || (summary?.avgPitch || 0) < thresholds.pitch.normalLow * 0.8) pWeight = 66;
+  if ((summary?.avgPitch || 0) > thresholds.pitch.normalHigh * 1.5 || (summary?.avgPitch || 0) < thresholds.pitch.normalLow * 0.6) pWeight = 100;
 
   const severityScore = Math.round((jWeight * 0.40) + (sWeight * 0.35) + (pWeight * 0.25));
   
@@ -198,15 +174,15 @@ function Dashboard({ recording }) {
   const needleX = 100 + 75 * Math.cos(angle);
   const needleY = 110 - 75 * Math.sin(angle);
 
-  // Radar chart from real analysis
+  // Radar chart from saved analysis
   const radarData = [
-    Math.min(4, (summary.avgPitch / 75)),
-    Math.min(4, summary.jitterPercent * 4),
-    Math.min(4, summary.shimmerDb * 8),
-    Math.min(4, summary.avgLoudness / 25),
-    Math.min(4, summary.voicedRatio * 4),
-    Math.min(4, meta.durationSeconds),
-    Math.min(4, summary.avgLoudness / 20),
+    Math.min(4, ((summary?.avgPitch || 0) / 75)),
+    Math.min(4, (summary?.jitterPercent || 0) * 4),
+    Math.min(4, (summary?.shimmerDb || 0) * 8),
+    Math.min(4, (summary?.avgLoudness || 0) / 25),
+    Math.min(4, (summary?.voicedRatio || 0) * 4),
+    Math.min(4, (meta?.durationSeconds || 0)),
+    Math.min(4, (summary?.avgLoudness || 0) / 20),
   ];
 
   return (
@@ -216,22 +192,14 @@ function Dashboard({ recording }) {
         <div>
           <h2 className="dashboard__greeting">Audio Analysis — {personName} 👋</h2>
           <p className="dashboard__subtitle">
-            Real DSP analysis of <strong>{recording.title}</strong> · {meta.totalFrames} frames analyzed
+            Saved analysis of <strong>{recording.title}</strong> · {(meta?.totalFrames || ticks?.length || 0)} frames analyzed
           </p>
         </div>
         
-        {/* Gender Override Selector */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', background: 'rgba(255,255,255,0.8)', padding: '6px 12px', borderRadius: '20px', border: '1px solid #ddd' }}>
+        {/* Gender Badge (read-only — fixed from client setup) */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', background: 'rgba(255,255,255,0.8)', padding: '6px 16px', borderRadius: '20px', border: '1px solid #ddd' }}>
           <span style={{ fontSize: '0.8rem', fontWeight: 600, color: '#555' }}>Clinical Baseline:</span>
-          <select 
-            value={overrideGender} 
-            onChange={(e) => setOverrideGender(e.target.value)}
-            style={{ padding: '4px 8px', borderRadius: '4px', border: '1px solid #ccc', background: '#fff', fontSize: '0.8rem', cursor: 'pointer' }}
-          >
-            <option value="Male">Male</option>
-            <option value="Female">Female</option>
-            <option value="Unknown">Unknown (General)</option>
-          </select>
+          <span style={{ fontSize: '0.8rem', fontWeight: 700, color: '#4CAF50', textTransform: 'uppercase' }}>{genderKey}</span>
         </div>
       </div>
 
@@ -254,7 +222,7 @@ function Dashboard({ recording }) {
             </div>
             <span className="dashboard__stat-badge">Hz</span>
           </div>
-          <div className="dashboard__stat-value">{summary.avgPitch}</div>
+          <div className="dashboard__stat-value">{summary?.avgPitch || 0}</div>
           <div className="dashboard__stat-label">Avg. Pitch (F0)</div>
         </div>
 
@@ -264,7 +232,7 @@ function Dashboard({ recording }) {
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>
             </div>
           </div>
-          <div className="dashboard__stat-value">{summary.jitterPercent}%</div>
+          <div className="dashboard__stat-value">{summary?.jitterPercent || 0}%</div>
           <div className="dashboard__stat-label">Jitter (local)</div>
         </div>
 
@@ -274,10 +242,39 @@ function Dashboard({ recording }) {
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="6" width="4" height="12" rx="1" /><rect x="7" y="4" width="4" height="16" rx="1" /><rect x="12" y="8" width="4" height="8" rx="1" /><rect x="17" y="2" width="4" height="20" rx="1" /></svg>
             </div>
           </div>
-          <div className="dashboard__stat-value">{summary.shimmerDb} dB</div>
+          <div className="dashboard__stat-value">{summary?.shimmerDb || 0} dB</div>
           <div className="dashboard__stat-label">Shimmer (dB)</div>
         </div>
       </div>
+
+      {/* AI Intake Summary (if available) */}
+      {recording.intakeSummary && (
+        <div style={{ background: 'linear-gradient(135deg, #f8f9fe, #eef7ee)', borderRadius: '16px', padding: '18px 22px', marginBottom: '20px', border: '1px solid #e0e8e0' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#4CAF50" strokeWidth="2"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2z" /><path d="M12 8v4l3 3" /></svg>
+            <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#4CAF50', textTransform: 'uppercase', letterSpacing: '0.5px' }}>AI Intake Summary</span>
+          </div>
+          <p style={{ fontSize: '0.85rem', color: '#333', lineHeight: 1.6, margin: '0 0 10px 0' }}>{recording.intakeSummary}</p>
+          {recording.focusAreas?.length > 0 && (
+            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+              {recording.focusAreas.map((area, i) => (
+                <span key={i} style={{ fontSize: '0.7rem', fontWeight: 600, color: '#4CAF50', background: '#e8f5e9', padding: '3px 10px', borderRadius: '12px', border: '1px solid #c8e6c9' }}>{area}</span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Live Transcription */}
+      {recording.transcript && (
+        <div style={{ background: '#fff', borderRadius: '16px', padding: '18px 22px', marginBottom: '20px', border: '1px solid #EBEBF0', boxShadow: '0 4px 12px rgba(0,0,0,0.03)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2196F3" strokeWidth="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+            <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#2196F3', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Live Transcription</span>
+          </div>
+          <p style={{ fontSize: '0.95rem', color: '#1a1a2e', lineHeight: 1.6, margin: '0' }}>{recording.transcript}</p>
+        </div>
+      )}
 
       {/* Bottom Section: Gauge + Clinical Thresholds */}
       <div className="dashboard__bottom">
@@ -299,9 +296,9 @@ function Dashboard({ recording }) {
             </svg>
           </div>
           <div style={{ display: 'flex', justifyContent: 'space-around', fontSize: '0.75rem', color: '#888', marginTop: 8 }}>
-            <span>Jitter: {summary.jitterPercent}%</span>
-            <span>Shimmer: {summary.shimmerDb} dB</span>
-            <span>Voiced: {(summary.voicedRatio * 100).toFixed(0)}%</span>
+            <span>Jitter: {summary?.jitterPercent || 0}%</span>
+            <span>Shimmer: {summary?.shimmerDb || 0} dB</span>
+            <span>Voiced: {((summary?.voicedRatio || 0) * 100).toFixed(0)}%</span>
           </div>
           <div style={{ fontSize: '0.65rem', color: '#aaa', marginTop: 6, textAlign: 'center' }}>
             Clinical thresholds — Jitter: &lt;1.04% normal · Shimmer: &lt;0.35 dB normal (Praat)
@@ -324,42 +321,42 @@ function Dashboard({ recording }) {
             {[
               {
                 label: 'Avg. Pitch (F0)',
-                value: summary.avgPitch, unit: 'Hz',
+                value: summary?.avgPitch || 0, unit: 'Hz',
                 ...thresholds.pitch
               },
               {
                 label: 'Pitch Range',
-                value: summary.maxPitch - summary.minPitch, unit: 'Hz',
+                value: (summary?.maxPitch || 0) - (summary?.minPitch || 0), unit: 'Hz',
                 ...thresholds.pitchRange
               },
               {
                 label: 'Jitter (local)',
-                value: summary.jitterPercent, unit: '%',
+                value: summary?.jitterPercent || 0, unit: '%',
                 ...thresholds.jitter
               },
               {
                 label: 'Shimmer (dB)',
-                value: summary.shimmerDb, unit: 'dB',
+                value: summary?.shimmerDb || 0, unit: 'dB',
                 ...thresholds.shimmer
               },
               {
                 label: 'Avg. Loudness',
-                value: summary.avgLoudness, unit: '%',
+                value: summary?.avgLoudness || 0, unit: '%',
                 ...thresholds.loudness
               },
               {
                 label: 'Voiced Ratio',
-                value: summary.voicedRatio * 100, unit: '%',
+                value: (summary?.voicedRatio || 0) * 100, unit: '%',
                 ...thresholds.voicedRatio
               },
               {
                 label: 'Speech Rate',
-                value: analysis.speechActivity.speechRate, unit: 'seg/s',
+                value: analysis?.speechActivity?.speechRate || 0, unit: 'seg/s',
                 ...thresholds.speechRate
               },
               {
                 label: 'Avg. Pause',
-                value: analysis.speechActivity.avgPauseDurationMs, unit: 'ms',
+                value: analysis?.speechActivity?.avgPauseDurationMs || 0, unit: 'ms',
                 ...thresholds.avgPause
               },
             ].map((d, i) => {
@@ -503,10 +500,10 @@ function Dashboard({ recording }) {
               </svg>
             </div>
             <div className="dashboard__waveform-xaxis" style={{ justifyContent: 'space-between', fontSize: '0.7rem' }}>
-              <span>{analysis.speechActivity.speechSegments} speech segments</span>
-              <span>{analysis.speechActivity.pauseSegments} pauses</span>
-              <span>Rate: {analysis.speechActivity.speechRate} seg/s</span>
-              <span>Longest pause: {analysis.speechActivity.longestPauseMs}ms</span>
+              <span>{analysis?.speechActivity?.speechSegments || 0} speech segments</span>
+              <span>{analysis?.speechActivity?.pauseSegments || 0} pauses</span>
+              <span>Rate: {analysis?.speechActivity?.speechRate || 0} seg/s</span>
+              <span>Longest pause: {analysis?.speechActivity?.longestPauseMs || 0}ms</span>
             </div>
           </div>
         </div>
@@ -581,6 +578,41 @@ function Dashboard({ recording }) {
           <div><strong>Method:</strong> Autocorrelation (ACF)</div>
         </div>
       </div>
+      
+      {/* AI Model Confidence */}
+      <div className="dashboard__confidence-card" style={{ marginTop: '20px' }}>
+        <h3 className="dashboard__section-title">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '6px', verticalAlign: 'middle' }}>
+            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+            <polyline points="22 4 12 14.01 9 11.01" />
+          </svg>
+          AI MODEL CONFIDENCE
+        </h3>
+        
+        {(() => {
+          const confidences = recording?.analysisData?.clinicalResult?.modelsConfidence || [];
+          if (confidences.length === 0) return <div style={{ fontSize: '0.85rem', color: '#888', marginTop: '12px' }}>No AI Confidence Data Available</div>;
+          
+          return (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '16px', marginTop: '12px' }}>
+              {confidences.map((item, i) => {
+                const readableName = item.model.replace('_expert.joblib', '').replace(/_/g, ' ').toUpperCase();
+                return (
+                  <div key={item.model} style={{ background: '#f8f9fe', padding: '12px 16px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+                      <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#4a5568' }}>{readableName}</span>
+                      <span style={{ fontSize: '0.75rem', fontWeight: 800, color: '#2196F3' }}>{item.confidence}%</span>
+                    </div>
+                    <div style={{ height: '6px', background: '#e2e8f0', borderRadius: '3px', overflow: 'hidden' }}>
+                      <div style={{ height: '100%', width: `${item.confidence}%`, background: '#2196F3', borderRadius: '3px' }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })()}
+      </div>
     </div>
   );
 }
@@ -601,9 +633,14 @@ function buildPath(ticks, getter, width, height, min, max) {
 // ── Helper: Get time labels at even intervals ────────────────
 function getTimeLabels(ticks, count) {
   if (!ticks?.length) return [];
+  const startT = ticks[0]?.t || 0;
   return Array.from({ length: count }, (_, i) => {
     const idx = Math.floor(i / (count - 1) * (ticks.length - 1));
-    const ms = ticks[idx]?.t || 0;
+    let ms = ticks[idx]?.t || 0;
+    // If it's a UNIX epoch timestamp, make it relative to the start
+    if (ms > 1000000000) {
+      ms = ms - startT;
+    }
     const sec = ms / 1000;
     const m = Math.floor(sec / 60);
     const s = Math.floor(sec % 60);

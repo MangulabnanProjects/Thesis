@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -15,10 +15,10 @@ import { useClientContext } from '../context/ClientContext';
 import { useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
 
 // ── Waveform Visualizer ──────────────────────────────────────
-function WaveformVisualizer({ width, isPlaying, analysisData }) {
+// Mirrors the website's playhead approach: bars change color as audio progresses
+function WaveformVisualizer({ width, progress, analysisData }) {
   const barCount = Math.floor((width - 32) / 5);
 
-  // If we have real analysis data, use it for bars
   const bars = useMemo(() => {
     if (analysisData?.ticks?.length > 0) {
       const ticks = analysisData.ticks;
@@ -40,6 +40,8 @@ function WaveformVisualizer({ width, isPlaying, analysisData }) {
       <View style={waveStyles.barsContainer}>
         {bars.map((amp, i) => {
           const h = 4 + amp * 50;
+          const barPct = (i / barCount) * 100;
+          const isPassed = barPct <= progress;
           return (
             <View
               key={i}
@@ -47,8 +49,8 @@ function WaveformVisualizer({ width, isPlaying, analysisData }) {
                 waveStyles.bar,
                 {
                   height: Math.max(3, h),
-                  backgroundColor: '#51CF66',
-                  opacity: isPlaying ? 0.6 + amp * 0.4 : 0.3,
+                  backgroundColor: isPassed ? '#51CF66' : '#D8D8DD',
+                  opacity: isPassed ? 0.7 + amp * 0.3 : 0.5,
                 },
               ]}
             />
@@ -74,6 +76,11 @@ const waveStyles = StyleSheet.create({
 });
 
 // ══════════════════════════════════════════════════════════════
+// PLAYER LOGIC — modeled after the website's Room.jsx
+// Website uses HTML <audio> element + direct .currentTime manipulation.
+// Mobile uses expo-audio's useAudioPlayer + polling interval.
+// KEY: expo-audio uses SECONDS (not ms) for currentTime and seekTo.
+// ══════════════════════════════════════════════════════════════
 export default function RoomScreen({ route }) {
   const { width: screenWidth } = useWindowDimensions();
   const cardWidth = screenWidth - 40;
@@ -85,8 +92,7 @@ export default function RoomScreen({ route }) {
   const autoPlay = route?.params?.autoPlay || false;
 
   const [isPlaying, setIsPlaying] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [elapsed, setElapsed] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);   // in seconds (like website)
   const [isLoading, setIsLoading] = useState(false);
 
   // Find the recording across all clients
@@ -109,8 +115,8 @@ export default function RoomScreen({ route }) {
     return recording.analysisData;
   }, [recording]);
 
-  // Duration in seconds
-  const durationSeconds = useMemo(() => {
+  // Duration in seconds — use recording metadata as fallback
+  const durationFromMeta = useMemo(() => {
     if (analysisData?.meta?.durationSeconds) return analysisData.meta.durationSeconds;
     if (recording?.duration) {
       const parts = recording.duration.split(':');
@@ -119,102 +125,127 @@ export default function RoomScreen({ route }) {
     return 0;
   }, [recording, analysisData]);
 
-  // Set up audio player — always call the hook (can't conditionally call hooks)
-  // Pass a valid source or undefined when no recording
-  const audioSource = recording?.uri ? { uri: recording.uri } : undefined;
+  // Set up audio player — expo-audio expects a raw URI string
+  const audioSource = recording?.uri ? recording.uri : null;
   const audioPlayer = useAudioPlayer(audioSource);
   const playerStatus = useAudioPlayerStatus(audioPlayer);
+
+  // Use the player's reported duration when available, else fallback to metadata
+  const audioDuration = useMemo(() => {
+    if (playerStatus?.duration && isFinite(playerStatus.duration) && playerStatus.duration > 0) {
+      return playerStatus.duration; // expo-audio: already in seconds
+    }
+    return durationFromMeta;
+  }, [playerStatus?.duration, durationFromMeta]);
+
+  // Dynamic seek step based on audio duration (user's exact spec)
+  const seekStep = useMemo(() => {
+    if (audioDuration <= 6) return 2;
+    if (audioDuration <= 15) return 5;
+    return 10;
+  }, [audioDuration]);
+
+  // Progress percentage for waveform and progress bar
+  const progressPct = audioDuration > 0 ? (currentTime / audioDuration) * 100 : 0;
+
+  // ── Polling interval: smooth playback tracking at ~10fps ──
+  // Same concept as website's 'timeupdate' event listener
+  useEffect(() => {
+    if (!isPlaying) return;
+    const interval = setInterval(() => {
+      try {
+        // expo-audio currentTime is in SECONDS
+        const t = audioPlayer.currentTime || 0;
+        setCurrentTime(t);
+      } catch { }
+    }, 100);
+    return () => clearInterval(interval);
+  }, [isPlaying, audioPlayer]);
+
+  // ── Sync isPlaying state with actual player status ──
+  // Same concept as website's 'ended' event handler
+  useEffect(() => {
+    if (!playerStatus) return;
+    if (playerStatus.playing && !isPlaying) {
+      setIsPlaying(true);
+    }
+    if (!playerStatus.playing && isPlaying) {
+      // Audio stopped (either paused or ended)
+      setIsPlaying(false);
+    }
+  }, [playerStatus?.playing]);
 
   // Stop playback when navigating away
   useFocusEffect(
     useCallback(() => {
       return () => {
-        try { audioPlayer.pause(); } catch {}
+        try { audioPlayer.pause(); } catch { }
         setIsPlaying(false);
       };
     }, [audioPlayer])
   );
 
-  // Update progress from player status
-  useEffect(() => {
-    if (playerStatus && durationSeconds > 0) {
-      const currentSec = (playerStatus.currentTime || 0) / 1000;
-      setElapsed(Math.floor(currentSec));
-      setProgress((currentSec / durationSeconds) * 100);
-
-      if (playerStatus.playing !== isPlaying) {
-        setIsPlaying(playerStatus.playing);
-      }
-    }
-  }, [playerStatus?.currentTime, playerStatus?.playing]);
-
   // Autoplay when coming from Storage
   useEffect(() => {
     if (autoPlay && recording?.uri) {
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         try {
           audioPlayer.play();
           setIsPlaying(true);
         } catch (e) {
           console.warn('Autoplay failed:', e);
         }
-      }, 500);
+      }, 600);
+      return () => clearTimeout(timer);
     }
   }, [autoPlay, recordingId]);
 
-  // Track if audio finished playing
-  const finishedRef = useRef(false);
-
-  // Detect playback completion — mark as finished
-  useEffect(() => {
-    if (!playerStatus) return;
-
-    // When the player stops playing and we thought it was playing → it finished
-    if (!playerStatus.playing && isPlaying) {
-      setIsPlaying(false);
-      finishedRef.current = true;
-    }
-  }, [playerStatus?.playing]);
-
-  const handlePlayPause = async () => {
+  // ── Play / Pause — same as website's handlePlay ──
+  const handlePlayPause = useCallback(async () => {
     if (!recording?.uri) return;
     try {
       if (isPlaying) {
         audioPlayer.pause();
         setIsPlaying(false);
       } else {
-        // If audio finished, reload the source to reset player completely
-        if (finishedRef.current) {
-          finishedRef.current = false;
-          setProgress(0);
-          setElapsed(0);
-          audioPlayer.replace({ uri: recording.uri });
-          // Small delay to let the player reload before playing
-          await new Promise(r => setTimeout(r, 300));
-        }
         audioPlayer.play();
         setIsPlaying(true);
       }
     } catch (e) {
       console.warn('Playback error:', e);
     }
-  };
+  }, [isPlaying, recording?.uri, audioPlayer]);
 
-  const handleSeek = (deltaSeconds) => {
-    if (!recording?.uri || durationSeconds === 0) return;
+  // ── Seek backward — same as website's handleBack ──
+  // Does NOT pause audio, just jumps the position
+  const handleBack = useCallback(() => {
+    if (!recording?.uri) return;
     try {
-      const currentMs = (playerStatus?.currentTime || 0);
-      const newMs = Math.max(0, Math.min(durationSeconds * 1000, currentMs + deltaSeconds * 1000));
-      audioPlayer.seekTo(newMs);
+      const newTime = Math.max(0, (audioPlayer.currentTime || 0) - seekStep);
+      audioPlayer.seekTo(newTime);
+      setCurrentTime(newTime);
     } catch (e) {
       console.warn('Seek error:', e);
     }
-  };
+  }, [seekStep, audioPlayer, recording?.uri]);
 
-  const formatTime = (totalSec) => {
-    const m = Math.floor(totalSec / 60);
-    const s = totalSec % 60;
-    return `${m}:${s.toString().padStart(2, '0')}`;
+  // ── Seek forward — same as website's handleForward ──
+  const handleForward = useCallback(() => {
+    if (!recording?.uri) return;
+    try {
+      const newTime = Math.min(audioDuration, (audioPlayer.currentTime || 0) + seekStep);
+      audioPlayer.seekTo(newTime);
+      setCurrentTime(newTime);
+    } catch (e) {
+      console.warn('Seek error:', e);
+    }
+  }, [seekStep, audioDuration, audioPlayer, recording?.uri]);
+
+  const formatTime = (s) => {
+    if (!s || !isFinite(s)) return '0:00';
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+    return `${m}:${sec.toString().padStart(2, '0')}`;
   };
 
   // Split transcription into words for highlight effect
@@ -226,10 +257,10 @@ export default function RoomScreen({ route }) {
 
   // Approximate word timing for highlight
   const activeWordIndex = useMemo(() => {
-    if (!isPlaying || words.length === 0 || durationSeconds === 0) return -1;
-    const wordIdx = Math.floor((elapsed / durationSeconds) * words.length);
+    if (!isPlaying || words.length === 0 || audioDuration === 0) return -1;
+    const wordIdx = Math.floor((currentTime / audioDuration) * words.length);
     return Math.min(wordIdx, words.length - 1);
-  }, [elapsed, durationSeconds, words, isPlaying]);
+  }, [currentTime, audioDuration, words, isPlaying]);
 
   // ── No recording selected ──
   if (!recordingId || !recording) {
@@ -245,20 +276,6 @@ export default function RoomScreen({ route }) {
       </View>
     );
   }
-
-  // ── Build summary data for analysis display ──
-  const summaryData = useMemo(() => {
-    if (!analysisData?.ticks?.length) return null;
-    const ticks = analysisData.ticks;
-    const avg = (arr, key) => arr.reduce((s, t) => s + (t[key] || 0), 0) / arr.length;
-    return {
-      avgPitch: avg(ticks, 'pitch').toFixed(1),
-      avgJitter: (avg(ticks, 'jitter') * 100).toFixed(2),
-      avgShimmer: (avg(ticks, 'shimmer') * 100).toFixed(2),
-      avgLoudness: avg(ticks, 'loudness').toFixed(1),
-      totalTicks: ticks.length,
-    };
-  }, [analysisData]);
 
   return (
     <View style={styles.container}>
@@ -288,16 +305,16 @@ export default function RoomScreen({ route }) {
             <Text style={styles.durationBadge}>{recording.duration}</Text>
           </View>
 
-          {/* Waveform */}
+          {/* Waveform — tracks progress just like website's playhead */}
           <View style={styles.waveformWrap}>
-            <WaveformVisualizer width={cardWidth - 40} isPlaying={isPlaying} analysisData={analysisData} />
+            <WaveformVisualizer width={cardWidth - 40} progress={progressPct} analysisData={analysisData} />
           </View>
 
-          {/* Play Controls */}
+          {/* Play Controls — matches website layout exactly */}
           <View style={styles.controls}>
-            <TouchableOpacity style={styles.seekBtn} onPress={() => handleSeek(-10)} activeOpacity={0.6}>
+            <TouchableOpacity style={styles.seekBtn} onPress={handleBack} activeOpacity={0.6}>
               <Ionicons name="play-back" size={18} color="#8E8E93" />
-              <Text style={styles.seekLabel}>10s</Text>
+              <Text style={styles.seekLabel}>{seekStep}s</Text>
             </TouchableOpacity>
 
             <TouchableOpacity
@@ -312,20 +329,20 @@ export default function RoomScreen({ route }) {
               )}
             </TouchableOpacity>
 
-            <TouchableOpacity style={styles.seekBtn} onPress={() => handleSeek(10)} activeOpacity={0.6}>
-              <Text style={styles.seekLabel}>10s</Text>
+            <TouchableOpacity style={styles.seekBtn} onPress={handleForward} activeOpacity={0.6}>
+              <Text style={styles.seekLabel}>{seekStep}s</Text>
               <Ionicons name="play-forward" size={18} color="#8E8E93" />
             </TouchableOpacity>
           </View>
 
           {/* Progress Bar */}
           <View style={styles.progressContainer}>
-            <Text style={styles.progressTime}>{formatTime(elapsed)}</Text>
+            <Text style={styles.progressTime}>{formatTime(currentTime)}</Text>
             <View style={styles.progressTrack}>
-              <View style={[styles.progressFill, { width: `${Math.min(progress, 100)}%` }]} />
-              <View style={[styles.progressDot, { left: `${Math.min(progress, 100)}%` }]} />
+              <View style={[styles.progressFill, { width: `${Math.min(progressPct, 100)}%` }]} />
+              <View style={[styles.progressDot, { left: `${Math.min(progressPct, 100)}%` }]} />
             </View>
-            <Text style={styles.progressTime}>{formatTime(durationSeconds)}</Text>
+            <Text style={styles.progressTime}>{formatTime(audioDuration)}</Text>
           </View>
         </View>
 
@@ -355,57 +372,121 @@ export default function RoomScreen({ route }) {
           </View>
         ) : null}
 
-        {/* Audio Analysis Data Card */}
-        {summaryData ? (
-          <View style={styles.card}>
-            <View style={styles.sectionHeader}>
-              <Ionicons name="bar-chart" size={18} color="#4CAF50" />
-              <Text style={styles.sectionTitle}>Audio Analysis</Text>
-              <Text style={styles.tickCount}>{summaryData.totalTicks} data points</Text>
+        {/* Clinical Parameters — matches website Dashboard */}
+        {(() => {
+          if (!analysisData?.ticks?.length) return null;
+          const ticks = analysisData.ticks;
+          const avg = (arr, key) => arr.reduce((s, t) => s + (t[key] || 0), 0) / arr.length;
+          
+          let avgPitch = analysisData.summary?.avgPitch ?? avg(ticks, 'pitch');
+          let avgJitter = analysisData.summary?.jitterPercent ?? avg(ticks, 'jitter') * 100;
+          let avgShimmer = analysisData.summary?.shimmerDb ?? avg(ticks, 'shimmer') * 100;
+          let avgLoudness = analysisData.summary?.avgLoudness ?? avg(ticks, 'loudness');
+
+          const genderKey = client?.gender?.toLowerCase() || 'unknown';
+          const THRESHOLDS = {
+            male:    { pitch: [85, 180], jitter: [0, 1.04], shimmer: [0, 0.35], loudness: [30, 70] },
+            female:  { pitch: [165, 255], jitter: [0, 1.04], shimmer: [0, 0.35], loudness: [30, 70] },
+            unknown: { pitch: [85, 255], jitter: [0, 1.04], shimmer: [0, 0.35], loudness: [30, 70] },
+          };
+          const th = THRESHOLDS[genderKey] || THRESHOLDS.unknown;
+
+          const getStatus = (val, range) => {
+            if (val >= range[0] && val <= range[1]) return { text: 'Normal', color: '#4CAF50', icon: 'checkmark-circle' };
+            if (val >= range[0] * 0.7 && val <= range[1] * 1.5) return { text: 'Borderline', color: '#ff9800', icon: 'warning' };
+            return { text: 'Abnormal', color: '#ea4335', icon: 'alert-circle' };
+          };
+
+          // Severity Score (same formula as website)
+          let jW = 0;
+          if (avgJitter > th.jitter[1]) jW = 33;
+          if (avgJitter > th.jitter[1] * 1.5) jW = 66;
+          if (avgJitter > th.jitter[1] * 2.5) jW = 100;
+          let sW = 0;
+          if (avgShimmer > th.shimmer[1]) sW = 33;
+          if (avgShimmer > th.shimmer[1] * 1.5) sW = 66;
+          if (avgShimmer > th.shimmer[1] * 2.5) sW = 100;
+          let pW = 0;
+          if (avgPitch > th.pitch[1] || avgPitch < th.pitch[0]) pW = 33;
+          if (avgPitch > th.pitch[1] * 1.2 || avgPitch < th.pitch[0] * 0.8) pW = 66;
+          if (avgPitch > th.pitch[1] * 1.5 || avgPitch < th.pitch[0] * 0.6) pW = 100;
+          const sevScore = Math.round((jW * 0.40) + (sW * 0.35) + (pW * 0.25));
+          let sevLabel = 'NORMAL', sevColor = '#4CAF50';
+          if (sevScore >= 70) { sevLabel = 'SEVERE'; sevColor = '#ea4335'; }
+          else if (sevScore >= 45) { sevLabel = 'MODERATE'; sevColor = '#ff9800'; }
+          else if (sevScore >= 20) { sevLabel = 'MILD'; sevColor = '#fbc02d'; }
+
+          const rows = [
+            { name: 'Pitch (F0)', val: avgPitch.toFixed(1), unit: 'Hz', range: th.pitch, status: getStatus(avgPitch, th.pitch) },
+            { name: 'Jitter', val: avgJitter.toFixed(2), unit: '%', range: th.jitter, status: getStatus(avgJitter, th.jitter) },
+            { name: 'Shimmer', val: avgShimmer.toFixed(2), unit: 'dB', range: th.shimmer, status: getStatus(avgShimmer, th.shimmer) },
+            { name: 'Loudness', val: avgLoudness.toFixed(1), unit: '%', range: th.loudness, status: getStatus(avgLoudness, th.loudness) },
+          ];
+
+          return (
+            <View style={styles.card}>
+              <View style={styles.sectionHeader}>
+                <Ionicons name="bar-chart" size={18} color="#4CAF50" />
+                <Text style={styles.sectionTitle}>Clinical Parameters</Text>
+                <Text style={styles.tickCount}>{genderKey.toUpperCase()}</Text>
+              </View>
+
+              {/* Severity Gauge */}
+              <View style={{ alignItems: 'center', marginBottom: 16, backgroundColor: '#FAFBFE', padding: 14, borderRadius: 14, borderWidth: 1, borderColor: '#EBEBF0' }}>
+                <Text style={{ fontSize: 11, fontWeight: '700', color: '#8E8E93', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>Voice Quality Index</Text>
+                <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 8, paddingHorizontal: 18, paddingVertical: 10, borderRadius: 24, borderWidth: 2, borderColor: sevColor, backgroundColor: sevColor + '12' }}>
+                  <Text style={{ fontSize: 26, fontWeight: '900', color: sevColor }}>{sevScore}</Text>
+                  <Text style={{ fontSize: 14, fontWeight: '700', color: sevColor, letterSpacing: 1 }}>{sevLabel}</Text>
+                </View>
+              </View>
+
+              {/* Clinical Table */}
+              <View style={{ borderWidth: 1, borderColor: '#EBEBF0', borderRadius: 12, overflow: 'hidden' }}>
+                <View style={{ flexDirection: 'row', backgroundColor: '#F0F1F5', paddingHorizontal: 12, paddingVertical: 7, borderBottomWidth: 1, borderColor: '#EBEBF0' }}>
+                  <Text style={{ flex: 2, fontSize: 10, fontWeight: '700', color: '#8E8E93', textTransform: 'uppercase' }}>Parameter</Text>
+                  <Text style={{ flex: 2, fontSize: 10, fontWeight: '700', color: '#8E8E93', textTransform: 'uppercase' }}>Patient</Text>
+                  <Text style={{ flex: 2, fontSize: 10, fontWeight: '700', color: '#8E8E93', textTransform: 'uppercase' }}>Normal</Text>
+                  <Text style={{ flex: 2, fontSize: 10, fontWeight: '700', color: '#8E8E93', textTransform: 'uppercase', textAlign: 'right' }}>Status</Text>
+                </View>
+                {rows.map((r, idx) => (
+                  <View key={idx} style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 11, borderBottomWidth: idx < rows.length - 1 ? 1 : 0, borderColor: '#F0F1F5' }}>
+                    <Text style={{ flex: 2, fontSize: 12, fontWeight: '700', color: '#1a1a2e' }}>{r.name}</Text>
+                    <Text style={{ flex: 2, fontSize: 12, color: '#636e72' }}>{r.val} {r.unit}</Text>
+                    <Text style={{ flex: 2, fontSize: 12, color: '#4CAF50' }}>{r.range[0]}–{r.range[1]} {r.unit}</Text>
+                    <View style={{ flex: 2, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center' }}>
+                      <Ionicons name={r.status.icon} size={13} color={r.status.color} style={{ marginRight: 3 }} />
+                      <Text style={{ fontSize: 11, fontWeight: '700', color: r.status.color }}>{r.status.text}</Text>
+                    </View>
+                  </View>
+                ))}
+              </View>
+
+              {/* AI Clinical Outputs */}
+              {analysisData?.clinicalResult && (
+                <View style={{ marginTop: 16, backgroundColor: '#FFF0F0', borderRadius: 12, padding: 14, borderWidth: 1, borderColor: '#FFCDD2' }}>
+                  <Text style={{ fontSize: 11, fontWeight: '700', color: '#FF5252', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 8 }}>AI Clinical Outputs</Text>
+                  
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 }}>
+                    <Text style={{ fontSize: 13, color: '#636e72', fontWeight: '600' }}>Final Severity</Text>
+                    <Text style={{ fontSize: 13, fontWeight: '700', color: '#FF5252' }}>{analysisData.clinicalResult.severity}</Text>
+                  </View>
+                  
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 }}>
+                    <Text style={{ fontSize: 13, color: '#636e72', fontWeight: '600' }}>Specific Anxiety</Text>
+                    <Text style={{ fontSize: 13, fontWeight: '700', color: '#1a1a2e', maxWidth: '60%', textAlign: 'right' }}>{analysisData.clinicalResult.specificAnxiety}</Text>
+                  </View>
+
+                  <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                    <Text style={{ fontSize: 13, color: '#636e72', fontWeight: '600' }}>Educational Problem</Text>
+                    <Text style={{ fontSize: 13, fontWeight: '700', color: '#9C27B0', maxWidth: '60%', textAlign: 'right' }}>{analysisData.clinicalResult.educationalProblem}</Text>
+                  </View>
+                </View>
+              )}
+
+              <Text style={{ fontSize: 10, color: '#A0A0A0', textAlign: 'center', marginTop: 10 }}>Reference: Praat clinical voice analysis standards</Text>
             </View>
-            <View style={styles.analysisGrid}>
-              <View style={[styles.analysisItem, { backgroundColor: '#E3F2FD' }]}>
-                <View style={[styles.analysisIcon, { backgroundColor: '#4285f420' }]}>
-                  <Ionicons name="musical-note" size={20} color="#4285f4" />
-                </View>
-                <View>
-                  <Text style={styles.analysisLabel}>Avg. Pitch (F0)</Text>
-                  <Text style={[styles.analysisValue, { color: '#4285f4' }]}>{summaryData.avgPitch} Hz</Text>
-                </View>
-              </View>
-
-              <View style={[styles.analysisItem, { backgroundColor: '#FFF8F0' }]}>
-                <View style={[styles.analysisIcon, { backgroundColor: '#FFA94D20' }]}>
-                  <Ionicons name="pulse" size={20} color="#FFA94D" />
-                </View>
-                <View>
-                  <Text style={styles.analysisLabel}>Avg. Jitter</Text>
-                  <Text style={[styles.analysisValue, { color: '#FFA94D' }]}>{summaryData.avgJitter}%</Text>
-                </View>
-              </View>
-
-              <View style={[styles.analysisItem, { backgroundColor: '#FFF0F8' }]}>
-                <View style={[styles.analysisIcon, { backgroundColor: '#E91E8C20' }]}>
-                  <Ionicons name="trending-up" size={20} color="#E91E8C" />
-                </View>
-                <View>
-                  <Text style={styles.analysisLabel}>Avg. Shimmer</Text>
-                  <Text style={[styles.analysisValue, { color: '#E91E8C' }]}>{summaryData.avgShimmer}%</Text>
-                </View>
-              </View>
-
-              <View style={[styles.analysisItem, { backgroundColor: '#E8F5E9' }]}>
-                <View style={[styles.analysisIcon, { backgroundColor: '#4CAF5020' }]}>
-                  <Ionicons name="volume-high" size={20} color="#4CAF50" />
-                </View>
-                <View>
-                  <Text style={styles.analysisLabel}>Avg. Loudness</Text>
-                  <Text style={[styles.analysisValue, { color: '#4CAF50' }]}>{summaryData.avgLoudness}%</Text>
-                </View>
-              </View>
-            </View>
-          </View>
-        ) : null}
+          );
+        })()}
 
         {/* Cloud Source Indicator */}
         <View style={styles.cloudNote}>

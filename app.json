@@ -7,13 +7,21 @@
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.clinicalvoice.app"
+      "bundleIdentifier": "com.clinicalvoice.app",
+      "infoPlist": {
+        "NSSpeechRecognitionUsageDescription": "Allow Clinical Voice to use speech recognition to transcribe audio in English and Tagalog.",
+        "NSMicrophoneUsageDescription": "Allow Clinical Voice to use your microphone for live transcription."
+      }
     },
     "android": {
       "adaptiveIcon": {
         "backgroundColor": "#1a1a2e"
       },
-      "package": "com.clinicalvoice.app"
+      "package": "com.clinicalvoice.app",
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
+      ]
     },
     "web": {},
     "plugins": [
@@ -31,6 +39,11 @@
         }
       ],
       "expo-sqlite"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "24b8a6a7-72f9-478f-bda4-04a121cca66c"
+      }
+    }
   }
 }

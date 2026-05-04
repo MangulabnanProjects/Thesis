@@ -4,6 +4,7 @@ import Dashboard from './components/Dashboard';
 import Room from './components/Room';
 import Records from './components/Records';
 import News from './components/News';
+import About from './components/About';
 import './App.css';
 
 function App() {
@@ -25,10 +26,8 @@ function App() {
         return <Records onPlayRecording={handlePlayRecording} />;
       case 'news':
         return <News />;
-      case 'summary':
-        return <PlaceholderPage title="Summary" description="View clinical summaries and reports." icon="📊" />;
       case 'about':
-        return <PlaceholderPage title="About" description="Learn more about Clinical Voice." icon="ℹ️" />;
+        return <About />;
       default:
         return <Dashboard />;
     }

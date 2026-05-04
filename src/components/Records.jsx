@@ -17,17 +17,21 @@ function Records({ onPlayRecording }) {
           if (!recordingsByClient[rec.clientId]) {
             recordingsByClient[rec.clientId] = [];
           }
+          const parsedAnalysis = rec.analysisData 
+            ? (typeof rec.analysisData === 'string' ? JSON.parse(rec.analysisData) : rec.analysisData)
+            : null;
+
           recordingsByClient[rec.clientId].push({
             id: rec.id,
             title: `Recording ${rec.date}`,
             date: rec.date,
             duration: rec.duration ? parseFloat(rec.duration.split(':')[0]) * 60 + parseFloat(rec.duration.split(':')[1]) : 0,
-            emotion: 'Pending Analysis',
-            anxiety: 'Pending Analysis',
-            severity: 'Moderate',
+            emotion: parsedAnalysis?.clinicalResult?.educationalProblem || 'Pending Analysis',
+            anxiety: parsedAnalysis?.clinicalResult?.specificAnxiety || 'Pending Analysis',
+            severity: parsedAnalysis?.clinicalResult?.severity || 'Moderate',
             confidence: 90,
             transcript: rec.transcription,
-            analysisData: rec.analysisData,
+            analysisData: parsedAnalysis,
             uri: rec.uri,
             archivedAt: rec.archivedAt || null,
           });
@@ -37,10 +41,12 @@ function Records({ onPlayRecording }) {
         clientsSnap.forEach((docSnap) => {
           const clientData = docSnap.data();
           const clientGender = clientData.gender || 'Unknown';
-          // Attach gender to each recording so Dashboard can use gender-specific thresholds
+          // Attach gender and client info to each recording so Dashboard can use them
           const recs = (recordingsByClient[clientData.id] || []).map(r => ({
             ...r,
             gender: clientGender,
+            personName: clientData.name,
+            requiredModels: clientData.requiredModels || [],
           }));
           mappedClients.push({
             id: clientData.id,

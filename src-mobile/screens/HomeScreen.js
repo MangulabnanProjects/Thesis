@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import {
   View,
   Text,
@@ -8,57 +8,68 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useClientContext } from '../context/ClientContext';
 
 const INFO_SECTIONS = [
-  {
-    title: 'Emotions',
-    icon: 'heart',
-    color: '#FF6B6B',
-    bgColor: '#FFF0F0',
-    description:
-      'Understanding emotional states is crucial for mental health assessment. This system analyzes vocal patterns to identify emotional indicators such as happiness, sadness, anger, fear, and neutral states.',
-    items: ['Happiness', 'Sadness', 'Anger', 'Fear', 'Neutral', 'Surprise'],
-  },
-  {
-    title: 'Anxiety Levels',
-    icon: 'pulse',
-    color: '#FFA94D',
-    bgColor: '#FFF8F0',
-    description:
-      'Anxiety manifests through vocal tremors, speech rate changes, and pitch variations. The system detects subtle voice markers to estimate anxiety levels.',
-    items: ['Minimal', 'Mild', 'Moderate', 'Severe'],
-  },
   {
     title: 'Severity Classification',
     icon: 'shield-checkmark',
     color: '#4CAF50',
     bgColor: '#E8F5E9',
-    description:
-      'Based on combined analysis of emotional state and anxiety indicators, an overall severity score is generated to assist clinical evaluation.',
-    items: ['Low Risk', 'Moderate Risk', 'High Risk', 'Critical'],
+    description: 'Our system classifies psychological stress severity into three distinct levels based on text and acoustic biomarkers.',
+    items: [
+      'Normal: A stable state with baseline stress that does not interfere with daily functioning.',
+      'Moderate: Noticeable stress symptoms that begin to affect daily focus and mood.',
+      'Severe: Intense symptoms that significantly impair daily life and cognitive function.'
+    ],
+  },
+  {
+    title: 'Psychological Problems',
+    icon: 'brain',
+    color: '#FF6B6B',
+    bgColor: '#FFF0F0',
+    description: 'We detect patterns indicative of core clinical anxiety disorders and traumatic stress indicators.',
+    items: [
+      'Social Anxiety: Intense fear of being judged, leading to avoidance of social situations.',
+      'PTSD: Triggered by terrifying events, characterized by flashbacks and severe anxiety.',
+      'Panic Attack: Sudden episodes of intense fear accompanied by physical symptoms.',
+      'GAD: Excessive, uncontrollable worry about everyday issues.',
+      'Agoraphobia: Fear of being in situations where escape might be difficult.'
+    ],
+  },
+  {
+    title: 'Educational Problems',
+    icon: 'school',
+    color: '#FFA94D',
+    bgColor: '#FFF8F0',
+    description: 'Academic environments introduce unique stressors. Our neutral baseline tracking looks for signs of these educational challenges.',
+    items: [
+      'Perfectionism & Impostor Syndrome',
+      'Test Anxiety & Academic Burnout',
+      'Low Self Esteem & Lack Of Academic Support',
+      'Fear Of Failure & Poor Time Management',
+      'Pressure Of Surroundings',
+      'Performance anxiety & Specific phobia'
+    ],
   },
 ];
 
 const TERMS = [
   {
-    term: 'Voice Biomarker',
-    definition:
-      'A measurable vocal characteristic used to identify emotional or psychological states.',
+    term: 'Acoustic Vitals (Biomarkers)',
+    definition: 'Measurable vocal characteristics, such as Pitch, Jitter, and Shimmer, that act as physiological lie detectors revealing physical stress.',
   },
   {
-    term: 'Spectral Analysis',
-    definition:
-      'The process of analyzing the frequency components of voice recordings.',
+    term: 'Likert Scale Intake',
+    definition: 'A psychometric assessment used during client setup to quantify the frequency of specific anxiety or trauma symptoms (0-3 scale).',
   },
   {
-    term: 'Prosody',
-    definition:
-      'The rhythm, stress, and intonation patterns of speech that carry emotional information.',
+    term: 'Severity Router',
+    definition: 'An intelligent filtration system that determines which specific AI models to load based on clinical urgency and client history.',
   },
   {
-    term: 'Fundamental Frequency (F0)',
-    definition:
-      'The lowest frequency of a voice signal, closely related to perceived pitch.',
+    term: 'Baseline Severity',
+    definition: 'The initial psychological risk level calculated purely from textual symptom tracking before acoustic parameters are applied.',
   },
 ];
 
@@ -66,6 +77,21 @@ export default function HomeScreen() {
   const { width, fontScale } = useWindowDimensions();
   const isSmall = width < 360;
   const pad = isSmall ? 14 : 20;
+
+  const { clients } = useClientContext();
+
+  // Compute real stats from database
+  const stats = useMemo(() => {
+    const activeClients = clients.filter(c => !c.archivedAt);
+    const allRecordings = activeClients.flatMap(c => (c.recordings || []).filter(r => !r.archivedAt));
+    const analyzedRecordings = allRecordings.filter(r => r.analysisData != null);
+
+    return {
+      recordings: allRecordings.length,
+      clients: activeClients.length,
+      analyzed: analyzedRecordings.length,
+    };
+  }, [clients]);
 
   return (
     <View style={styles.container}>
@@ -88,17 +114,17 @@ export default function HomeScreen() {
         <View style={styles.statsRow}>
           <View style={[styles.statCard, { backgroundColor: '#E8F5E9' }]}>
             <Ionicons name="mic" size={20} color="#4CAF50" />
-            <Text style={styles.statNumber}>—</Text>
+            <Text style={styles.statNumber}>{stats.recordings}</Text>
             <Text style={styles.statLabel}>Recordings</Text>
           </View>
           <View style={[styles.statCard, { backgroundColor: '#FFF0F0' }]}>
             <Ionicons name="people" size={20} color="#FF6B6B" />
-            <Text style={styles.statNumber}>—</Text>
+            <Text style={styles.statNumber}>{stats.clients}</Text>
             <Text style={styles.statLabel}>Clients</Text>
           </View>
           <View style={[styles.statCard, { backgroundColor: '#F0FFF4' }]}>
             <Ionicons name="analytics" size={20} color="#51CF66" />
-            <Text style={styles.statNumber}>—</Text>
+            <Text style={styles.statNumber}>{stats.analyzed}</Text>
             <Text style={styles.statLabel}>Analyzed</Text>
           </View>
         </View>
