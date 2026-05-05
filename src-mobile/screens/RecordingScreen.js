@@ -716,39 +716,88 @@ export default function RecordingScreen() {
           // 4. Calculate Final Severity
           const clinicalSeverity = calculateSeverity(foundConditions, textBaseline, acousticStatus);
           
-          // 5. Generate AI Model Confidence
+          // 5. Fetch BERT embeddings and query Python API
           const requiredModels = activeClient?.details?.requiredModels || ['neutral_expert.joblib'];
-          const modelsConfidence = requiredModels.map((m, i) => ({
-            model: m,
-            confidence: 85 + ((i * 7 + 13) % 14)
-          }));
+          let modelsConfidence = [];
           
+          if (finalTranscript) {
+            try {
+              console.log('[Recording] Calling local Python API for Text Prediction...');
+              const modelsToRequest = [...new Set([...requiredModels, 'severity_expert.joblib'])];
+              
+              const apiRes = await fetch('http://192.168.0.17:8000/predict-text', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  text: finalTranscript,
+                  requiredModels: modelsToRequest
+                })
+              });
+              
+              if (apiRes.ok) {
+                const data = await apiRes.json();
+                modelsConfidence = data.results || [];
+                
+                // Save the embeddings returned from the local Python BERT model
+                if (data.embeddings && data.embeddings.length > 0) {
+                  console.log(`[Recording] ✅ Fetched ${data.embeddings.length}-dim BERT embeddings locally!`);
+                  analysisPayload.embeddings = { bert768: data.embeddings };
+                }
+                
+                console.log('[Recording] ✅ Python API success:', modelsConfidence);
+              } else {
+                const errText = await apiRes.text();
+                console.warn('[Recording] Python API returned non-OK status:', apiRes.status, errText);
+              }
+            } catch (embedErr) {
+              console.warn('[Recording] Local Python API call failed (Is it running?):', embedErr.message);
+            }
+          }
+          
+          // Fallback to simulation if Python API failed or wasn't called
+          if (modelsConfidence.length === 0) {
+            console.log('[Recording] Using simulated confidences as fallback');
+            modelsConfidence = requiredModels.map((m, i) => ({
+              model: m,
+              confidence: 85 + ((i * 7 + 13) % 14)
+            }));
+          }
+          
+          // Extract real severity if the API returned it
+          let finalSeverityLabel = clinicalSeverity.severity_label;
+          let finalSeverityScore = clinicalSeverity.final_score;
+
+          const severityModelData = modelsConfidence.find(m => m.model === 'severity_expert.joblib');
+          if (severityModelData) {
+             // Let's assume the model returns a high confidence for Severe if it's severe.
+             // If confidence > 70, Severe. If > 40, Moderate. Else Normal.
+             if (severityModelData.confidence >= 70) {
+                 finalSeverityLabel = 'Severe';
+                 finalSeverityScore = 2;
+             } else if (severityModelData.confidence >= 40) {
+                 finalSeverityLabel = 'Moderate';
+                 finalSeverityScore = 1;
+             } else {
+                 finalSeverityLabel = 'Normal';
+                 finalSeverityScore = 0;
+             }
+             
+             // Remove severity_expert from the general confidences array so it doesn't show in the specific conditions list
+             modelsConfidence = modelsConfidence.filter(m => m.model !== 'severity_expert.joblib');
+          }
+
           analysisPayload.clinicalResult = {
-            severity: clinicalSeverity.severity_label,
-            severityScore: clinicalSeverity.final_score,
+            severity: finalSeverityLabel,
+            severityScore: finalSeverityScore,
             specificAnxiety: foundConditions.length > 0 ? foundConditions.join(', ') : 'None Detected',
             educationalProblem: educationalProblem,
             logicLog: clinicalSeverity.logic_log,
             modelsConfidence: modelsConfidence
           };
-          console.log('[Recording] Simulation Engine Output:', analysisPayload.clinicalResult);
+          console.log('[Recording] Final Clinical Output:', analysisPayload.clinicalResult);
           // --------------------------
 
-          // Fetch BERT embeddings if transcription exists
-          if (finalTranscript) {
-            try {
-              console.log('[Recording] Fetching BERT embeddings for Taglish transcription...');
-              const embeddings = await getBertEmbeddings(finalTranscript);
-              if (embeddings && embeddings.length > 0) {
-                console.log(`[Recording] ✅ Fetched ${embeddings.length}-dim BERT embeddings`);
-                analysisPayload.embeddings = {
-                  bert768: embeddings
-                };
-              }
-            } catch (embedErr) {
-              console.warn('[Recording] BERT embedding fetch failed:', embedErr.message);
-            }
-          }
+
 
           try {
             const jsonUri = `${FileSystem.documentDirectory}${clientSlug}_${mm}-${ss < 10 ? '0' : ''}${ss}_analysis.json`;

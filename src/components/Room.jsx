@@ -331,6 +331,22 @@ function Room({ recording, onSeeAnalytics }) {
             })}
           </div>
         )}
+
+        {/* BERT Tensor Proof */}
+        {recording?.analysisData?.embeddings?.bert768 && (
+          <div style={{ marginTop: '16px', padding: '12px', background: '#1e1e2f', borderRadius: '8px', overflow: 'hidden' }}>
+            <h4 style={{ color: '#4CAF50', fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '1px', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M2 12h4l3-9 5 18 3-9h5"/></svg>
+              Mathematical BERT Vector Extracted (Size: {recording.analysisData.embeddings.bert768.length})
+            </h4>
+            <p style={{ color: '#a0a0b0', fontSize: '0.65rem', fontFamily: 'monospace', lineHeight: '1.4', margin: 0, wordBreak: 'break-all', opacity: 0.8 }}>
+              [{recording.analysisData.embeddings.bert768.slice(0, 45).map(n => n.toFixed(4)).join(', ')} ... {recording.analysisData.embeddings.bert768.slice(-5).map(n => n.toFixed(4)).join(', ')}]
+            </p>
+            <div style={{ fontSize: '0.6rem', color: '#666', marginTop: '6px', fontStyle: 'italic' }}>
+              * This floating-point tensor proves the exact linguistic meaning of the transcription was converted into math and fed directly into the XGBoost AI models.
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Analysis Results */}

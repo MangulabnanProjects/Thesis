@@ -1,8 +1,8 @@
 // ── Shared Hugging Face token (used for both summarization & BERT embeddings) ──
-const HF_TOKEN = 'YOUR_HUGGINGFACE_TOKEN';
+const HF_TOKEN = 'YOUR_HUGGING_FACE_TOKEN_HERE';
 
 // ── Gemini (primary) ──
-const GEMINI_API_KEY = 'YOUR_GEMINI_API_KEY';
+const GEMINI_API_KEY = 'YOUR_GEMINI_API_KEY_HERE';
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${GEMINI_API_KEY}`;
 
 // ── The prompt used for both providers ──
@@ -31,7 +31,7 @@ function parseAIResponse(rawText) {
         summary: parsed.summary || '',
         focusAreas: Array.isArray(parsed.focusAreas) ? parsed.focusAreas : [],
       };
-    } catch {}
+    } catch { }
   }
   return { summary: cleaned.substring(0, 500), focusAreas: [] };
 }
@@ -119,43 +119,53 @@ export async function getBertEmbeddings(text) {
 
   const HF_API_URL = 'https://api-inference.huggingface.co/pipeline/feature-extraction/bert-base-multilingual-cased';
 
-  try {
-    const response = await fetch(HF_API_URL, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${HF_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ inputs: text }),
-    });
+  let retries = 3;
+  while (retries > 0) {
+    try {
+      const response = await fetch(HF_API_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${HF_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ inputs: text }),
+      });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.warn(`[BERT] API Error: ${response.status} - ${errorText}`);
+      if (!response.ok) {
+        const errorText = await response.text();
+        if (response.status === 503) {
+          console.warn(`[BERT] Model is loading (503). Retrying in 5 seconds... (${retries} retries left)`);
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          retries--;
+          continue;
+        }
+        console.warn(`[BERT] API Error: ${response.status} - ${errorText}`);
+        return [];
+      }
+
+      const data = await response.json();
+
+      // HuggingFace feature-extraction typically returns:
+      // 1D array (if pooling is enabled) OR 3D array [batch, tokens, features].
+      // If it's 3D, we usually want the mean pooling of the tokens or the CLS token (index 0).
+
+      if (Array.isArray(data) && data.length > 0) {
+        if (typeof data[0] === 'number') {
+          return data; // Already 1D array of floats
+        } else if (Array.isArray(data[0]) && Array.isArray(data[0][0])) {
+          // It's a 3D array [1, num_tokens, 768]. We'll take the CLS token (the first token).
+          return data[0][0];
+        } else if (Array.isArray(data[0]) && typeof data[0][0] === 'number') {
+          // It's a 2D array [num_tokens, 768]. Take the CLS token.
+          return data[0];
+        }
+      }
+
+      return [];
+    } catch (error) {
+      console.error('[BERT] Failed to fetch embeddings:', error.message);
       return [];
     }
-
-    const data = await response.json();
-
-    // HuggingFace feature-extraction typically returns:
-    // 1D array (if pooling is enabled) OR 3D array [batch, tokens, features].
-    // If it's 3D, we usually want the mean pooling of the tokens or the CLS token (index 0).
-
-    if (Array.isArray(data) && data.length > 0) {
-      if (typeof data[0] === 'number') {
-        return data; // Already 1D array of floats
-      } else if (Array.isArray(data[0]) && Array.isArray(data[0][0])) {
-        // It's a 3D array [1, num_tokens, 768]. We'll take the CLS token (the first token).
-        return data[0][0];
-      } else if (Array.isArray(data[0]) && typeof data[0][0] === 'number') {
-        // It's a 2D array [num_tokens, 768]. Take the CLS token.
-        return data[0];
-      }
-    }
-
-    return [];
-  } catch (error) {
-    console.error('[BERT] Failed to fetch embeddings:', error.message);
-    return [];
   }
+  return [];
 }
